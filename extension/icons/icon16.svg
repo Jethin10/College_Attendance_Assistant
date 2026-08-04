@@ -1,4 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-  <rect width="16" height="16" rx="3" fill="#1a1a3e"/>
-  <text x="8" y="12" font-family="Arial,sans-serif" font-size="10" font-weight="bold" fill="#6366f1" text-anchor="middle">%</text>
+  <!-- 16px variant. The ring and check from the master icon collapse into mud
+       at this size, so the mark is drawn alone at a weight that survives
+       downscaling to a favicon-sized tile. -->
+  <rect width="16" height="16" rx="3.5" fill="#2f6be0"/>
+  <path d="M4.2 8.4 L6.7 10.9 L11.8 5.4" fill="none" stroke="#ffffff"
+        stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>

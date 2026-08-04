@@ -1,152 +1,149 @@
-/* ============================================================
-   NIET Attendance Planner — On-Page Overlay v2
-   Injects into the NIET ERP portal (light background).
-   Premium, refined style that complements the portal.
-   ============================================================ */
+/* ==========================================================================
+   Attendance Planner — on-page overlay
+
+   Injected into the NIET ERP, which is a light-themed portal. This deliberately
+   uses a light surface and the portal's own font metrics so it reads as part of
+   the page rather than a foreign widget pasted on top.
+   ========================================================================== */
 
 [data-niet-planner] {
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text",
+               "Segoe UI", system-ui, Roboto, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
+  box-sizing: border-box;
 }
 
-/* ---- Summary banner above the attendance table ---- */
+[data-niet-planner] *, [data-niet-planner] *::before, [data-niet-planner] *::after {
+  box-sizing: border-box;
+}
+
+/* ------------------------- Summary bar ------------------------- */
 .niet-planner-summary {
-  margin: 0 0 14px;
-  padding: 12px 16px;
-  background: #0a0d12;
-  border: 1px solid rgba(240, 246, 252, .08);
-  border-radius: 12px;
-  color: #e6edf3;
-  animation: nietFadeIn .4s cubic-bezier(.4, 0, .2, 1) forwards;
-  opacity: 0;
-  transform: translateY(-8px);
-  box-shadow: 0 4px 20px rgba(0, 0, 0, .15);
-  position: relative;
-  overflow: hidden;
-}
-
-/* Subtle gradient line on top */
-.niet-planner-summary::before {
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 2px;
-  background: linear-gradient(90deg, transparent, #4a9eff, #63b3ff, transparent);
-  opacity: .6;
-}
-
-@keyframes nietFadeIn {
-  to { opacity: 1; transform: translateY(0); }
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  background: #ffffff;
+  border: 1px solid rgba(0, 0, 0, .10);
+  border-left: 3px solid #2f6be0;
+  border-radius: 8px;
+  color: #1c1c1e;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .04);
 }
 
 .niet-planner-summary__inner {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 16px;
   flex-wrap: wrap;
 }
 
 .niet-planner-summary__brand {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  min-width: 110px;
+  min-width: 130px;
 }
 
 .niet-planner-summary__logo {
-  color: #63b3ff;
+  color: #1c1c1e;
   font-size: 12px;
-  font-weight: 700;
-  letter-spacing: -.2px;
+  font-weight: 600;
+  line-height: 1.3;
 }
 
 .niet-planner-summary__caption {
-  color: #5e6a7d;
-  font-size: 10px;
+  color: #8e8e93;
+  font-size: 10.5px;
+  line-height: 1.3;
+}
+
+.niet-planner-summary__stats {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  flex: 1;
 }
 
 .niet-planner-summary__stat {
   display: inline-flex;
   flex-direction: column;
-  gap: 2px;
-  min-width: 80px;
-  padding: 8px 12px;
-  border-radius: 8px;
-  background: rgba(240, 246, 252, .05);
-  border: 1px solid rgba(240, 246, 252, .06);
-  color: #94a0b4;
-  font-size: 9px;
+  gap: 1px;
+  color: #6a6a70;
+  font-size: 10px;
   font-weight: 500;
+  letter-spacing: .02em;
   text-transform: uppercase;
-  letter-spacing: .4px;
-  transition: all .15s ease;
-}
-
-.niet-planner-summary__stat:hover {
-  background: rgba(240, 246, 252, .08);
-  border-color: rgba(240, 246, 252, .1);
 }
 
 .niet-planner-summary__stat strong {
-  color: #f0f4f8;
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: -.3px;
+  color: #1c1c1e;
+  font-size: 16px;
+  font-weight: 600;
   text-transform: none;
+  letter-spacing: -.01em;
   font-variant-numeric: tabular-nums;
 }
 
-/* Status text colors */
-.niet-planner-status--safe     { color: #4ade80 !important; }
-.niet-planner-status--warning  { color: #fbbf24 !important; }
-.niet-planner-status--critical { color: #f87171 !important; }
-
-/* ---- Per-row badges ---- */
-.niet-planner-badge {
-  display: inline-flex;
-  align-items: center;
+.niet-planner-summary__dismiss {
+  flex-shrink: 0;
+  width: 22px;
   height: 22px;
-  padding: 0 10px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: #8e8e93;
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+.niet-planner-summary__dismiss:hover { background: #f0f0f2; color: #1c1c1e; }
+
+/* Status colours — !important is required to beat the portal's own
+   table styles, which set colours with high-specificity selectors. */
+.niet-planner-status--safe     { color: #1a7f4b !important; }
+.niet-planner-status--warning  { color: #a86400 !important; }
+.niet-planner-status--critical { color: #c02626 !important; }
+
+/* --------------------------- Row badges --------------------------- */
+.niet-planner-badge {
+  display: inline-block;
   margin-left: 8px;
-  border-radius: 9999px;
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  padding: 1px 7px;
+  border-radius: 99px;
   font-size: 10px;
   font-weight: 600;
-  line-height: 1;
+  line-height: 1.6;
   white-space: nowrap;
   vertical-align: middle;
-  animation: nietBadgeIn .3s cubic-bezier(.175, .885, .32, 1.05) forwards;
-  opacity: 0;
-  transform: scale(.9);
-  letter-spacing: .2px;
-}
-
-@keyframes nietBadgeIn {
-  to { opacity: 1; transform: scale(1); }
 }
 
 .niet-planner-badge--safe {
-  color: #15803d;
-  background: rgba(74, 222, 128, .12);
-  border: 1px solid rgba(74, 222, 128, .15);
+  color: #1a7f4b;
+  background: #e8f5ee;
+  border: 1px solid rgba(26, 127, 75, .18);
 }
 
 .niet-planner-badge--warning {
-  color: #a16207;
-  background: rgba(251, 191, 36, .12);
-  border: 1px solid rgba(251, 191, 36, .15);
+  color: #a86400;
+  background: #fdf2e2;
+  border: 1px solid rgba(168, 100, 0, .18);
 }
 
 .niet-planner-badge--critical {
-  color: #dc2626;
-  background: rgba(248, 113, 113, .12);
-  border: 1px solid rgba(248, 113, 113, .15);
+  color: #c02626;
+  background: #fdeaea;
+  border: 1px solid rgba(192, 38, 38, .18);
 }
 
-/* Subtle row hover interaction */
-tr:hover .niet-planner-badge {
-  filter: brightness(1.08);
-  transition: filter .12s ease;
+.niet-planner-badge--neutral {
+  color: #6a6a70;
+  background: #f0f0f2;
+  border: 1px solid rgba(0, 0, 0, .08);
+}
+
+@media print {
+  [data-niet-planner] { display: none !important; }
 }

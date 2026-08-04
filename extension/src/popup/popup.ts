@@ -1,22 +1,44 @@
 /**
- * Popup App - main controller for the extension popup.
+ * Popup controller.
  *
- * Fetches dashboard data, renders the UI, triggers live refresh from the
- * active NIET ERP tab, and handles simulation plus pasted-data import.
+ * The headline answers one question — "can I miss a class right now?" — and it
+ * answers it from the student's WEAKEST subject, because NIET requires 75% in
+ * each subject individually. Aggregate percentage is shown as supporting
+ * detail only, so it can be cross-checked against the ERP.
  */
 
 import type { DashboardData, DashboardSubject, SimulationResult } from "@/lib/types";
 import { buildSnapshot, parseAttendanceHtml, parseAttendanceText } from "@/lib/erp-parser";
 
+const MAX_LISTED_CLASSES = 8;
+
 function $(id: string): HTMLElement {
-  return document.getElementById(id)!;
+  const element = document.getElementById(id);
+  if (!element) {
+    throw new Error(`Missing element: ${id}`);
+  }
+  return element;
 }
 
 function sendMessage(type: string, payload?: unknown): Promise<any> {
   return chrome.runtime.sendMessage({ type, payload });
 }
 
-const RING_CIRCUMFERENCE = 2 * Math.PI * 42;
+/** Builds an element with text content — never interpolates into innerHTML. */
+function el(tag: string, className?: string, text?: string) {
+  const node = document.createElement(tag);
+  if (className) {
+    node.className = className;
+  }
+  if (text !== undefined) {
+    node.textContent = text;
+  }
+  return node;
+}
+
+function plural(count: number, singular: string, pluralForm = `${singular}es`) {
+  return count === 1 ? singular : pluralForm;
+}
 
 function localDateInputValue(date = new Date()) {
   const year = date.getFullYear();
@@ -27,265 +49,366 @@ function localDateInputValue(date = new Date()) {
 
 function formatDateLabel(dateText: string) {
   const [year, month, day] = dateText.split("-").map(Number);
-  const date = new Date(year, (month ?? 1) - 1, day ?? 1);
-  return date.toLocaleDateString("en-IN", {
+  return new Date(year, (month ?? 1) - 1, day ?? 1).toLocaleDateString("en-IN", {
+    weekday: "short",
     day: "2-digit",
     month: "short",
-    year: "numeric",
-    weekday: "short",
   });
 }
 
-function setRingPercent(percent: number, status: string) {
-  const ring = $("ring-fill") as unknown as SVGCircleElement;
-  const offset = RING_CIRCUMFERENCE - (percent / 100) * RING_CIRCUMFERENCE;
-  ring.style.strokeDasharray = `${RING_CIRCUMFERENCE}`;
-  ring.style.strokeDashoffset = `${offset}`;
+/* ------------------------------ Verdict ------------------------------ */
 
-  ring.classList.remove("progress-ring__fill--safe", "progress-ring__fill--warning", "progress-ring__fill--critical");
-  if (status === "safe") {
-    ring.classList.add("progress-ring__fill--safe");
-  } else if (status === "warning") {
-    ring.classList.add("progress-ring__fill--warning");
-  } else if (status === "critical") {
-    ring.classList.add("progress-ring__fill--critical");
-  }
-}
+function renderVerdict(dashboard: DashboardData) {
+  const verdict = $("verdict");
+  const headline = $("verdict-headline");
+  const detail = $("verdict-detail");
+  const meta = $("verdict-meta");
+  const { overall } = dashboard;
 
-function animateValue(element: HTMLElement, target: number, prefix = "", suffix = "") {
-  const duration = 600;
-  const start = 0;
-  const startTime = performance.now();
+  meta.replaceChildren();
 
-  function update(currentTime: number) {
-    const elapsed = currentTime - startTime;
-    const progress = Math.min(elapsed / duration, 1);
-    const easeOut = 1 - Math.pow(1 - progress, 3);
-    const current = Math.round(start + (target - start) * easeOut);
-    element.textContent = prefix + current + suffix;
-
-    if (progress < 1) {
-      requestAnimationFrame(update);
-    }
-  }
-
-  requestAnimationFrame(update);
-}
-
-function buildHeadline(dashboard: DashboardData): string {
-  if (!dashboard.subjects.length) {
-    return "Open NIET ERP or import data to get started.";
-  }
-  if (dashboard.overall.status === "critical") {
-    return `Below 75%. Attend ${dashboard.overall.recoveryClassesNeeded} straight class${dashboard.overall.recoveryClassesNeeded === 1 ? "" : "es"} to recover.`;
-  }
-  if (!dashboard.calendarSessions.length) {
-    if (dashboard.timetableSync.status === "error") {
-      return dashboard.timetableSync.message ?? "Attendance imported. Timetable sync pending.";
-    }
-    return "Open NIET portal once to sync your class schedule.";
-  }
-  if (dashboard.overall.safeLeaveDays > 0) {
-    return `You can take ${dashboard.overall.safeLeaveDays} full day${dashboard.overall.safeLeaveDays === 1 ? "" : "s"} off and stay safe.`;
-  }
-  if (dashboard.overall.bunkableClasses > 0) {
-    return `You can miss ${dashboard.overall.bunkableClasses} more class${dashboard.overall.bunkableClasses === 1 ? "" : "es"}.`;
-  }
-  return "At the edge. Any absence drops you below 75%.";
-}
-
-function renderDashboard(dashboard: DashboardData) {
-  const studentBits = [
-    dashboard.student.studentName,
-    dashboard.student.semesterLabel,
-  ].filter(Boolean);
-  $("student-context").textContent =
-    studentBits.length > 0 ? studentBits.join(" • ") : "NIET portal";
-
-  const percentEl = $("overall-percent");
-  animateValue(percentEl, dashboard.overall.attendancePercent);
-  setRingPercent(dashboard.overall.attendancePercent, dashboard.overall.status);
-
-  $("headline").textContent = buildHeadline(dashboard);
-  const syncNote = $("sync-note");
-  if (dashboard.calendarSessions.length > 0) {
-    syncNote.textContent = dashboard.timetableSync.rangeEnd
-      ? `Synced until ${dashboard.timetableSync.rangeEnd}`
-      : "Schedule synced";
-  } else {
-    syncNote.textContent = dashboard.timetableSync.message ?? "Open portal to sync";
-  }
-
-  const statusChip = $("overall-status");
-  statusChip.textContent = dashboard.overall.status;
-  statusChip.className = `status-pill status-pill--${dashboard.overall.status}`;
-
-  const bunkableEl = $("stat-bunkable") as HTMLElement;
-  animateValue(bunkableEl, dashboard.overall.bunkableClasses);
-
-  const leaveDaysEl = $("stat-leave-days") as HTMLElement;
-  animateValue(leaveDaysEl, dashboard.overall.safeLeaveDays);
-
-  const nextMissEl = $("stat-next-miss") as HTMLElement;
-  nextMissEl.innerHTML = `-${dashboard.overall.nextMissDropPercent}<span class="stat-card__unit">%</span>`;
-
-  const recoveryEl = $("stat-recovery") as HTMLElement;
-  animateValue(recoveryEl, dashboard.overall.recoveryClassesNeeded);
-
-  renderSubjects(dashboard.subjects);
-}
-
-function renderSubjects(subjects: DashboardSubject[]) {
-  const container = $("subjects-list");
-
-  if (subjects.length === 0) {
-    container.innerHTML = `
-      <div class="empty-state">
-        <svg class="empty-state__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-          <path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"></path>
-        </svg>
-        <p class="empty-state__title">No data yet</p>
-        <p class="empty-state__desc">Open the NIET portal or paste attendance data in Settings to get started.</p>
-      </div>
-    `;
+  if (dashboard.subjects.length === 0) {
+    verdict.dataset.state = "empty";
+    headline.textContent = "No attendance data yet";
+    detail.textContent = "Open your attendance page on the NIET ERP and this fills in automatically.";
     return;
   }
 
-  const ordered = [...subjects].sort((a, b) => {
-    const priority: Record<string, number> = { critical: 0, warning: 1, safe: 2 };
-    return (priority[a.status] ?? 3) - (priority[b.status] ?? 3);
-  });
+  const started = dashboard.subjects.filter((subject) => subject.status !== "not-started");
 
-  container.innerHTML = ordered
-    .map(
-      (subject) => `
-        <div class="subject-card subject-card--${subject.status}">
-          <div class="subject-card__top">
-            <div class="subject-card__info">
-              <div class="subject-card__name" title="${subject.name}">${subject.name}</div>
-              <div class="subject-card__code">${subject.code}</div>
-            </div>
-            <span class="subject-card__percent subject-card__percent--${subject.status}">${subject.status === "not-started" ? "Not started" : `${subject.attendancePercent}%`}</span>
-          </div>
-          <div class="subject-card__meta">
-            <span class="subject-card__bunks subject-card__bunks--${subject.status}">${subject.status === "not-started" ? "No attendance yet" : `${subject.bunkableClasses} bunks left`}</span>
-            <span class="subject-card__attendance">${subject.attendedClasses}/${subject.heldClasses} classes</span>
-          </div>
-          <div class="subject-card__bar">
-            <div class="subject-card__bar-fill subject-card__bar-fill--${subject.status}" style="width: ${Math.min(subject.attendancePercent, 100)}%"></div>
-          </div>
-        </div>
-      `,
-    )
-    .join("");
+  if (started.length === 0) {
+    verdict.dataset.state = "empty";
+    headline.textContent = "No classes held yet";
+    detail.textContent = "Your subjects are listed, but none have conducted classes so far.";
+    return;
+  }
+
+  verdict.dataset.state = overall.status;
+
+  if (overall.status === "critical") {
+    const need = overall.recoveryClassesNeeded;
+    headline.textContent = "Below 75% — do not miss class";
+    detail.textContent =
+      overall.bindingSubjectName
+        ? `${overall.bindingSubjectName} is at ${overall.bindingSubjectPercent}%. Attend ${need} more ${plural(need, "class")} across your weak subjects to recover.`
+        : `Attend ${need} more ${plural(need, "class")} to recover.`;
+  } else if (overall.safeToMissClasses === 0) {
+    headline.textContent = "No margin left";
+    detail.textContent = overall.bindingSubjectName
+      ? `${overall.bindingSubjectName} is at ${overall.bindingSubjectPercent}%. The next missed class drops it below 75%.`
+      : "The next missed class drops you below 75%.";
+  } else {
+    const count = overall.safeToMissClasses;
+    headline.textContent = `Safe to miss ${count} ${plural(count, "class")}`;
+    detail.textContent = overall.bindingSubjectName
+      ? `Limited by ${overall.bindingSubjectName} at ${overall.bindingSubjectPercent}%.`
+      : "Based on your weakest subject.";
+  }
+
+  const stats: Array<[string, string]> = [
+    ["Overall", `${overall.attendancePercent}%`],
+  ];
+
+  if (dashboard.calendarSessions.length > 0 && overall.safeLeaveDays > 0) {
+    stats.push([
+      "Full days off",
+      `${overall.safeLeaveDays}`,
+    ]);
+  }
+
+  if (overall.status !== "critical" && overall.safeToMissClasses > 0) {
+    stats.push(["Next miss costs", `${overall.nextMissDropPercent}%`]);
+  }
+
+  const belowCount = dashboard.insights.belowThresholdCount;
+  if (belowCount > 0) {
+    stats.push([belowCount === 1 ? "Subject below 75%" : "Subjects below 75%", `${belowCount}`]);
+  }
+
+  for (const [label, value] of stats) {
+    const item = el("span");
+    item.append(`${label} `, el("strong", undefined, value));
+    meta.append(item);
+  }
 }
+
+/* ------------------------------ Notice ------------------------------ */
+
+function renderNotice(dashboard: DashboardData) {
+  const notice = $("notice");
+  const text = $("notice-text");
+  const action = $("notice-action");
+  const sync = dashboard.timetableSync;
+
+  action.classList.add("hidden");
+  notice.classList.remove("notice--error");
+
+  if (sync.status === "session-expired") {
+    notice.classList.remove("hidden");
+    notice.classList.add("notice--error");
+    text.textContent = "Your ERP session expired. Sign in again, then refresh.";
+    return;
+  }
+
+  if (sync.status === "error") {
+    notice.classList.remove("hidden");
+    text.textContent = sync.message ?? "Could not sync your schedule from the portal.";
+    return;
+  }
+
+  // Attendance without a schedule still works, but leave-day estimates need dates.
+  if (dashboard.subjects.length > 0 && dashboard.calendarSessions.length === 0) {
+    notice.classList.remove("hidden");
+    text.textContent = "Open the ERP once to sync your timetable for leave planning.";
+    return;
+  }
+
+  notice.classList.add("hidden");
+}
+
+/* ------------------------------ Subjects ------------------------------ */
+
+function renderSubjects(dashboard: DashboardData) {
+  const container = $("subjects-list");
+  const subjects = dashboard.subjects;
+  container.replaceChildren();
+
+  if (subjects.length === 0) {
+    const empty = el("div", "empty");
+    empty.append(
+      el("p", "empty__title", "Nothing to show yet"),
+      el(
+        "p",
+        "empty__body",
+        "Sign in to the NIET ERP and open your attendance page. This reads it automatically — no setup, no typing your timetable.",
+      ),
+    );
+    container.append(empty);
+    return;
+  }
+
+  const rank: Record<string, number> = { critical: 0, warning: 1, safe: 2, "not-started": 3 };
+  const ordered = [...subjects].sort(
+    (a, b) =>
+      (rank[a.status] ?? 4) - (rank[b.status] ?? 4) ||
+      a.bunkableClasses - b.bunkableClasses ||
+      a.attendancePercent - b.attendancePercent,
+  );
+
+  for (const subject of ordered) {
+    container.append(subjectRow(subject, dashboard.overall.bindingSubjectId));
+  }
+}
+
+function subjectRow(subject: DashboardSubject, bindingId?: string) {
+  const isBinding = subject.id === bindingId;
+  const row = el("div", `subject subject--${subject.status}${isBinding ? " subject--binding" : ""}`);
+
+  const top = el("div", "subject__top");
+  top.append(
+    el("span", "subject__name", subject.name),
+    el(
+      "span",
+      `subject__percent subject__percent--${subject.status}`,
+      subject.status === "not-started" ? "—" : `${subject.attendancePercent}%`,
+    ),
+  );
+
+  const meta = el("div", "subject__meta");
+
+  if (subject.status === "not-started") {
+    meta.textContent = `${subject.code} · no classes held yet`;
+  } else {
+    meta.append(`${subject.code} · ${subject.attendedClasses}/${subject.heldClasses} · `);
+
+    if (subject.status === "critical") {
+      const need = subject.recoveryClassesNeeded;
+      meta.append(
+        el("span", "subject__flag", `attend ${need} to recover`),
+      );
+    } else if (subject.bunkableClasses === 0) {
+      meta.append(el("span", "subject__flag", "no margin left"));
+    } else {
+      meta.append(`${subject.bunkableClasses} to spare`);
+    }
+
+    if (isBinding && subject.status !== "critical") {
+      meta.append(" · your limit");
+    }
+  }
+
+  row.append(top, meta);
+  return row;
+}
+
+/* ---------------------------- Simulation ---------------------------- */
 
 function renderSimResult(result: SimulationResult) {
-  const el = $("sim-result");
-  el.classList.add("visible");
+  const wrap = $("sim-result");
+  wrap.classList.remove("hidden");
 
-  const title = $("sim-result-title");
-  const statusChip = $("sim-result-status");
-  const body = $("sim-result-body");
-  const statsEl = $("sim-result-stats");
-  const impactSummary = $("sim-impact-summary");
-  const impactList = $("sim-impact-list");
-  const classListWrap = $("sim-class-list-wrap");
-  const classList = $("sim-class-list");
   const overall = result.overall;
+  const worst = [...result.projections].sort((a, b) => a.afterPercent - b.afterPercent)[0];
 
-  title.textContent = `${overall.beforePercent}% → ${overall.afterPercent}%`;
-  statusChip.textContent = overall.status;
-  statusChip.className = `status-pill status-pill--${overall.status}`;
+  $("sim-result-title").textContent = `${overall.beforePercent}% → ${overall.afterPercent}% overall`;
 
-  if (overall.afterPercent < 75) {
-    body.textContent = `Not safe. Missing ${overall.classesMissed} class${overall.classesMissed === 1 ? "" : "es"} drops you to ${overall.afterPercent}%. You'll need ${overall.recoveryClassesNeeded} more classes to recover.`;
+  const status = $("sim-result-status");
+  status.textContent = overall.status === "critical" ? "Not safe" : overall.status === "warning" ? "Tight" : "Safe";
+  status.className = `pill pill--${overall.status}`;
+
+  const body = $("sim-result-body");
+  const missed = overall.classesMissed;
+
+  if (missed === 0) {
+    body.textContent = "No classes fall in that window, so your attendance is unchanged.";
+  } else if (overall.status === "critical") {
+    const breached = result.projections.filter((p) => p.afterPercent < 75);
+    const names = breached.map((p) => p.subjectName).join(", ");
+    body.textContent = names
+      ? `Missing ${missed} ${plural(missed, "class")} puts ${names} below 75%. That is enough to be detained from exams.`
+      : `Missing ${missed} ${plural(missed, "class")} puts you below 75%.`;
+  } else if (worst) {
+    body.textContent = `Missing ${missed} ${plural(missed, "class")} is survivable. Your weakest subject afterwards is ${worst.subjectName} at ${worst.afterPercent}%.`;
   } else {
-    body.textContent = `Safe. After missing ${overall.classesMissed} class${overall.classesMissed === 1 ? "" : "es"}, you'll be at ${overall.afterPercent}%. You still have ${overall.safeLeaveDaysRemaining} full leave day${overall.safeLeaveDaysRemaining === 1 ? "" : "s"} left.`;
+    body.textContent = `Missing ${missed} ${plural(missed, "class")} keeps every subject above 75%.`;
   }
 
-  statsEl.innerHTML = `
-    <div class="sim-stat">
-      <span class="sim-stat__label">Classes Missed</span>
-      <span class="sim-stat__value">${overall.classesMissed}</span>
-    </div>
-    <div class="sim-stat">
-      <span class="sim-stat__label">Drop</span>
-      <span class="sim-stat__value">-${overall.deltaPercent}%</span>
-    </div>
-    <div class="sim-stat">
-      <span class="sim-stat__label">Recovery Needed</span>
-      <span class="sim-stat__value">${overall.recoveryClassesNeeded}</span>
-    </div>
-    <div class="sim-stat">
-      <span class="sim-stat__label">Leave Days Left</span>
-      <span class="sim-stat__value">${overall.safeLeaveDaysRemaining}</span>
-    </div>
-  `;
+  const stats = $("sim-result-stats");
+  stats.replaceChildren();
 
-  if (result.projections.length > 0) {
-    impactSummary.classList.remove("hidden");
-    impactList.innerHTML = result.projections
-      .sort((a, b) => b.classesMissed - a.classesMissed || a.subjectName.localeCompare(b.subjectName))
-      .map(
-        (projection) => `
-          <div class="sim-impact-card">
-            <div class="sim-impact-card__info">
-              <strong>${projection.subjectName}</strong>
-              <span>Missed ${projection.classesMissed} | ${projection.beforePercent}% → ${projection.afterPercent}%</span>
-            </div>
-            <span class="status-pill status-pill--${projection.status}">${projection.afterPercent}%</span>
-          </div>
-        `,
-      )
-      .join("");
-  } else {
-    impactSummary.classList.add("hidden");
-    impactList.innerHTML = "";
+  const entries: Array<[string, string]> = [
+    ["Classes missed", `${missed}`],
+    ["Days off still safe", `${overall.safeLeaveDaysRemaining}`],
+  ];
+
+  if (overall.recoveryClassesNeeded > 0) {
+    entries.push(["Classes to recover", `${overall.recoveryClassesNeeded}`]);
+    entries.push([
+      "Days to recover",
+      overall.recoveryBeyondSchedule ? `${overall.recoveryDaysNeeded}+` : `${overall.recoveryDaysNeeded}`,
+    ]);
   }
 
-  if (result.impactedSlots.length > 0) {
-    classListWrap.classList.remove("hidden");
-    classList.innerHTML = result.impactedSlots
-      .slice()
-      .sort((a, b) => {
-        const byDate = a.date.localeCompare(b.date);
-        if (byDate !== 0) return byDate;
-        return a.startTime.localeCompare(b.startTime);
-      })
-      .slice(0, 10)
-      .map(
-        (slot) => `
-          <div class="sim-class-card">
-            <div>
-              <div class="sim-class-card__title">${slot.subjectName}</div>
-              <div class="sim-class-card__meta">${formatDateLabel(slot.date)} · ${slot.startTime} - ${slot.endTime}</div>
-            </div>
-          </div>
-        `,
-      )
-      .join("");
+  for (const [label, value] of entries) {
+    const cell = el("div");
+    cell.append(el("dt", "result__stat-label", label), el("dd", "result__stat-value", value));
+    stats.append(cell);
+  }
 
-    if (result.impactedSlots.length > 10) {
-      classList.innerHTML += `<div class="sim-class-card" style="text-align:center;opacity:0.6;">+ ${result.impactedSlots.length - 10} more classes</div>`;
-    }
-  } else {
-    classListWrap.classList.add("hidden");
-    classList.innerHTML = "";
+  if (overall.recoveryBeyondSchedule) {
+    stats.append(
+      el(
+        "p",
+        "result__stat-label",
+        "Recovery runs past your synced schedule, so the day count is a lower bound.",
+      ),
+    );
+  }
+
+  renderImpacts(result);
+  renderAffectedClasses(result);
+}
+
+function renderImpacts(result: SimulationResult) {
+  const block = $("sim-impact-summary");
+  const list = $("sim-impact-list");
+  list.replaceChildren();
+
+  if (result.projections.length === 0) {
+    block.classList.add("hidden");
+    return;
+  }
+
+  block.classList.remove("hidden");
+
+  const ordered = [...result.projections].sort(
+    (a, b) => a.afterPercent - b.afterPercent || b.classesMissed - a.classesMissed,
+  );
+
+  for (const projection of ordered) {
+    const row = el("div", "impact");
+    const info = el("div");
+    info.append(
+      el("div", "impact__name", projection.subjectName),
+      el(
+        "div",
+        "impact__meta",
+        `${projection.classesMissed} missed · ${projection.beforePercent}% → ${projection.afterPercent}%`,
+      ),
+    );
+    row.append(
+      info,
+      el("span", `impact__value impact__value--${projection.status}`, `${projection.afterPercent}%`),
+    );
+    list.append(row);
   }
 }
 
+function renderAffectedClasses(result: SimulationResult) {
+  const block = $("sim-class-list-wrap");
+  const list = $("sim-class-list");
+  list.replaceChildren();
+
+  if (result.impactedSlots.length === 0) {
+    block.classList.add("hidden");
+    return;
+  }
+
+  block.classList.remove("hidden");
+
+  const ordered = [...result.impactedSlots].sort(
+    (a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime),
+  );
+
+  for (const slot of ordered.slice(0, MAX_LISTED_CLASSES)) {
+    const row = el("div", "class-row");
+    row.append(
+      el("div", "class-row__name", slot.subjectName),
+      el("div", "class-row__meta", `${formatDateLabel(slot.date)} · ${slot.startTime}–${slot.endTime}`),
+    );
+    list.append(row);
+  }
+
+  const hidden = ordered.length - MAX_LISTED_CLASSES;
+  if (hidden > 0) {
+    list.append(el("div", "class-row class-row--more", `and ${hidden} more`));
+  }
+}
+
+/* ------------------------------ Render ------------------------------ */
+
+function renderDashboard(dashboard: DashboardData) {
+  const bits = [
+    dashboard.student.studentName,
+    dashboard.student.branch,
+    dashboard.student.section,
+    dashboard.student.semesterLabel,
+  ].filter((value): value is string => Boolean(value && value.trim()));
+
+  $("student-context").textContent = bits.length > 0 ? bits.join(" · ") : "NIET Greater Noida";
+
+  renderVerdict(dashboard);
+  renderNotice(dashboard);
+  renderSubjects(dashboard);
+}
+
+/* -------------------------------- Init -------------------------------- */
+
 function initTabs() {
-  const tabs = document.querySelectorAll(".tab");
-  const panels = document.querySelectorAll(".tab-panel");
+  const tabs = Array.from(document.querySelectorAll<HTMLElement>(".tab"));
+  const panels = Array.from(document.querySelectorAll<HTMLElement>(".panel"));
 
   tabs.forEach((tab) => {
     tab.addEventListener("click", () => {
-      const targetId = (tab as HTMLElement).dataset.tab;
-      tabs.forEach((item) => item.classList.remove("active"));
-      panels.forEach((item) => item.classList.remove("active"));
-      tab.classList.add("active");
-      $(`tab-${targetId}`).classList.add("active");
+      tabs.forEach((item) => {
+        item.classList.remove("is-active");
+        item.setAttribute("aria-selected", "false");
+      });
+      panels.forEach((panel) => panel.classList.remove("is-active"));
+
+      tab.classList.add("is-active");
+      tab.setAttribute("aria-selected", "true");
+      $(`tab-${tab.dataset.tab}`).classList.add("is-active");
     });
   });
 }
@@ -295,10 +418,12 @@ function initSimulator() {
   const leaveFields = $("sim-leave-fields");
   const rangeFields = $("sim-range-fields");
   const futureFields = $("sim-future-fields");
+  const errorEl = $("sim-error");
 
   const today = localDateInputValue();
   ($("sim-from-date") as HTMLInputElement).value = today;
   ($("sim-range-from") as HTMLInputElement).value = today;
+
   const nextWeek = new Date();
   nextWeek.setDate(nextWeek.getDate() + 7);
   ($("sim-range-to") as HTMLInputElement).value = localDateInputValue(nextWeek);
@@ -309,51 +434,80 @@ function initSimulator() {
     futureFields.classList.toggle("hidden", modeSelect.value !== "future-count");
   });
 
-  $("btn-simulate").addEventListener("click", async () => {
+  const button = $("btn-simulate") as HTMLButtonElement;
+
+  button.addEventListener("click", async () => {
+    errorEl.classList.add("hidden");
+
     const mode = modeSelect.value;
-    const request: Record<string, unknown> = { mode, subjectId: "" };
+    const request: Record<string, unknown> = { mode };
 
     if (mode === "leave-days") {
-      request.leaveDays = Number(($("sim-leave-days") as HTMLInputElement).value);
+      const days = Number(($("sim-leave-days") as HTMLInputElement).value);
+      if (!Number.isFinite(days) || days < 1) {
+        errorEl.textContent = "Enter how many days you want to take off.";
+        errorEl.classList.remove("hidden");
+        return;
+      }
+      request.leaveDays = days;
       request.fromDate = ($("sim-from-date") as HTMLInputElement).value;
     } else if (mode === "date-range") {
-      request.fromDate = ($("sim-range-from") as HTMLInputElement).value;
-      request.toDate = ($("sim-range-to") as HTMLInputElement).value;
-    } else if (mode === "future-count") {
-      request.futureClasses = Number(($("sim-future-count") as HTMLInputElement).value);
+      const from = ($("sim-range-from") as HTMLInputElement).value;
+      const to = ($("sim-range-to") as HTMLInputElement).value;
+      if (!from || !to) {
+        errorEl.textContent = "Pick both a start and an end date.";
+        errorEl.classList.remove("hidden");
+        return;
+      }
+      if (to < from) {
+        errorEl.textContent = "The end date is before the start date.";
+        errorEl.classList.remove("hidden");
+        return;
+      }
+      request.fromDate = from;
+      request.toDate = to;
+    } else {
+      const count = Number(($("sim-future-count") as HTMLInputElement).value);
+      if (!Number.isFinite(count) || count < 1) {
+        errorEl.textContent = "Enter how many classes you might miss.";
+        errorEl.classList.remove("hidden");
+        return;
+      }
+      request.futureClasses = count;
     }
 
-    const button = $("btn-simulate") as HTMLButtonElement;
-    button.textContent = "Calculating...";
+    button.textContent = "Checking…";
     button.disabled = true;
 
     try {
       const response = await sendMessage("RUN_SIMULATION", request);
       if (response?.success && response.result) {
         renderSimResult(response.result);
-        const dashboardResponse = await sendMessage("GET_DASHBOARD");
-        if (dashboardResponse?.success) {
-          renderDashboard(dashboardResponse.dashboard);
-        }
+      } else {
+        errorEl.textContent = response?.error ?? "Could not run that check.";
+        errorEl.classList.remove("hidden");
       }
-    } catch (error) {
-      console.error("[Popup] Simulation failed:", error);
+    } catch {
+      errorEl.textContent = "Could not run that check.";
+      errorEl.classList.remove("hidden");
     } finally {
-      button.textContent = "Calculate Impact";
+      button.textContent = "Check impact";
       button.disabled = false;
     }
   });
 }
 
 function initPasteImport() {
-  $("btn-import-paste").addEventListener("click", async () => {
-    const textareaEl = $("paste-data") as HTMLTextAreaElement;
-    const resultEl = $("paste-result");
-    const raw = textareaEl.value.trim();
+  const button = $("btn-import-paste") as HTMLButtonElement;
+
+  button.addEventListener("click", async () => {
+    const textarea = $("paste-data") as HTMLTextAreaElement;
+    const result = $("paste-result");
+    const raw = textarea.value.trim();
 
     if (!raw) {
-      resultEl.textContent = "Paste some attendance data first.";
-      resultEl.className = "settings-result settings-result--error";
+      result.textContent = "Paste your attendance table first.";
+      result.className = "field__note field__note--bad";
       return;
     }
 
@@ -361,61 +515,73 @@ function initPasteImport() {
     const parsed = isHtml ? parseAttendanceHtml(raw) : parseAttendanceText(raw);
 
     if (parsed.length === 0) {
-      resultEl.textContent = "Couldn't parse any subjects. Try the full attendance table.";
-      resultEl.className = "settings-result settings-result--error";
+      result.textContent = "Could not read any subjects from that. Copy the whole table including its headings.";
+      result.className = "field__note field__note--bad";
       return;
     }
 
-    const snapshot = buildSnapshot(
-      parsed,
-      "Imported from pasted data in extension popup.",
-      [],
-    );
-
     try {
-      const response = await sendMessage("IMPORT_PASTED", snapshot);
+      const response = await sendMessage(
+        "IMPORT_PASTED",
+        buildSnapshot(parsed, "Pasted into the extension popup.", []),
+      );
+
       if (response?.success) {
-        resultEl.textContent = `Imported ${parsed.length} subjects successfully.`;
-        resultEl.className = "settings-result settings-result--success";
+        result.textContent = `Imported ${parsed.length} ${parsed.length === 1 ? "subject" : "subjects"}.`;
+        result.className = "field__note field__note--ok";
+        textarea.value = "";
         renderDashboard(response.dashboard);
-        textareaEl.value = "";
       } else {
-        resultEl.textContent = response?.error ?? "Import failed.";
-        resultEl.className = "settings-result settings-result--error";
+        result.textContent = response?.error ?? "Could not save that.";
+        result.className = "field__note field__note--bad";
       }
-    } catch (_error) {
-      resultEl.textContent = "Failed to save data.";
-      resultEl.className = "settings-result settings-result--error";
+    } catch {
+      result.textContent = "Could not save that.";
+      result.className = "field__note field__note--bad";
+    }
+  });
+}
+
+function initOverlayToggle() {
+  const toggle = $("toggle-overlay") as HTMLInputElement;
+
+  toggle.addEventListener("change", () => {
+    void sendMessage("SET_OVERLAY_PREFERENCE", toggle.checked);
+  });
+
+  void sendMessage("GET_PREFERENCES").then((response) => {
+    if (response?.success) {
+      toggle.checked = response.preferences?.showPageOverlay ?? true;
     }
   });
 }
 
 function initRefresh() {
-  const refreshBtn = $("btn-refresh");
+  const button = $("btn-refresh");
 
-  refreshBtn.addEventListener("click", async () => {
-    refreshBtn.classList.add("loading");
-    refreshBtn.style.pointerEvents = "none";
+  button.addEventListener("click", async () => {
+    button.classList.add("is-busy");
 
     try {
       const response = await sendMessage("SCRAPE_ACTIVE_TAB");
+
       if (response?.success) {
         renderDashboard(response.dashboard);
-        refreshBtn.classList.remove("loading");
-        refreshBtn.style.pointerEvents = "";
         return;
       }
 
-      const headline = $("headline");
-      headline.textContent = response?.error ?? "Open NIET ERP tab to refresh.";
-
+      // Refresh failed — keep whatever is stored and explain why.
       const fallback = await sendMessage("GET_DASHBOARD");
       if (fallback?.success) {
         renderDashboard(fallback.dashboard);
       }
+
+      const notice = $("notice");
+      notice.classList.remove("hidden");
+      notice.classList.add("notice--error");
+      $("notice-text").textContent = response?.error ?? "Open your NIET ERP attendance page to refresh.";
     } finally {
-      refreshBtn.classList.remove("loading");
-      refreshBtn.style.pointerEvents = "";
+      button.classList.remove("is-busy");
     }
   });
 }
@@ -424,17 +590,26 @@ async function main() {
   initTabs();
   initSimulator();
   initPasteImport();
+  initOverlayToggle();
   initRefresh();
+
+  const manifest = chrome.runtime.getManifest();
+  $("version-label").textContent = `Attendance Planner ${manifest.version}`;
 
   try {
     const response = await sendMessage("GET_DASHBOARD");
     if (response?.success) {
       renderDashboard(response.dashboard);
+    } else {
+      $("verdict").dataset.state = "empty";
+      $("verdict-headline").textContent = "Could not load your data";
+      $("verdict-detail").textContent = "Try reopening the extension.";
     }
-  } catch (error) {
-    console.error("[Popup] Failed to load data:", error);
-    $("headline").textContent = "Couldn't load data. Try refreshing.";
+  } catch {
+    $("verdict").dataset.state = "empty";
+    $("verdict-headline").textContent = "Could not load your data";
+    $("verdict-detail").textContent = "Try reopening the extension.";
   }
 }
 
-main();
+void main();

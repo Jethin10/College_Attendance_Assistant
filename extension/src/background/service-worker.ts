@@ -1,5 +1,9 @@
 /**
- * Background service worker - routes messages and keeps the action badge updated.
+ * Background service worker — message router and action-badge owner.
+ *
+ * The badge shows the student's LOWEST subject percentage rather than their
+ * aggregate, because NIET requires 75% in each subject individually and the
+ * aggregate can look healthy while a subject is already failing.
  */
 
 import {
@@ -9,10 +13,12 @@ import {
   replaceTimetable,
   saveErpSnapshot,
   savePortalTimetable,
+  saveStudentProfile,
   saveTimetableSyncError,
   saveSimulation,
+  setOverlayPreference,
 } from "@/lib/storage";
-import type { ERPImportSnapshot, SimulationRequest } from "@/lib/types";
+import type { ERPImportSnapshot, SimulationRequest, StudentProfile } from "@/lib/types";
 import { buildSnapshot } from "@/lib/erp-parser";
 
 type FallbackPortalData = {
@@ -47,29 +53,43 @@ type FallbackPortalData = {
   rangeStart: string;
   rangeEnd: string;
   message?: string;
+  sessionExpired?: boolean;
   student?: ERPImportSnapshot["student"];
 };
 
 async function updateBadge() {
   try {
     const dashboard = await getDashboardData();
-    const percent = dashboard.overall.attendancePercent;
+
+    if (dashboard.subjects.length === 0) {
+      await chrome.action.setBadgeText({ text: "" });
+      return;
+    }
+
+    // Worst subject, not the average — that is the number that can detain you.
+    const percent =
+      dashboard.overall.bindingSubjectPercent ?? dashboard.overall.attendancePercent;
     const status = dashboard.overall.status;
 
-    await chrome.action.setBadgeText({ text: `${percent}%` });
+    await chrome.action.setBadgeText({ text: `${Math.floor(percent)}` });
 
     const colors: Record<string, string> = {
-      safe: "#059669",
-      warning: "#d97706",
-      critical: "#dc2626",
+      safe: "#1a7f4b",
+      warning: "#a86400",
+      critical: "#c02626",
     };
-    await chrome.action.setBadgeBackgroundColor({ color: colors[status] ?? "#6366f1" });
+    await chrome.action.setBadgeBackgroundColor({ color: colors[status] ?? "#3f6ad8" });
+    await chrome.action.setBadgeTextColor?.({ color: "#ffffff" });
   } catch (error) {
     console.warn("[NIET Planner SW] Failed to update badge:", error);
     await chrome.action.setBadgeText({ text: "" });
   }
 }
 
+/**
+ * Runs when the content script has not loaded (freshly installed extension on
+ * an already-open tab). Self-contained because it is serialised into the page.
+ */
 async function fallbackScrapeWithScripting(tabId: number) {
   const [injection] = await chrome.scripting.executeScript({
     target: { tabId },
@@ -77,8 +97,7 @@ async function fallbackScrapeWithScripting(tabId: number) {
     func: async () => {
       const TIMETABLE_RANGE_DAYS = 45;
 
-      const normalizeWhitespace = (value: string) =>
-        value.replace(/\s+/g, " ").trim();
+      const normalizeWhitespace = (value: string) => value.replace(/\s+/g, " ").trim();
 
       const normalizeHeader = (value: string) =>
         normalizeWhitespace(value)
@@ -106,8 +125,7 @@ async function fallbackScrapeWithScripting(tabId: number) {
         };
       };
 
-      const getRows = (table: ParentNode) =>
-        Array.from(table.querySelectorAll("tr"));
+      const getRows = (table: ParentNode) => Array.from(table.querySelectorAll("tr"));
 
       const findHeaderIndex = (headers: string[], aliases: string[]) =>
         headers.findIndex((header) => aliases.includes(header));
@@ -142,17 +160,9 @@ async function fallbackScrapeWithScripting(tabId: number) {
         const text = normalizeWhitespace(table.textContent ?? "").toLowerCase();
         let score = 0;
 
-        if (text.includes("attendance")) {
-          score += 5;
-        }
-
-        if (text.includes("course") || text.includes("subject")) {
-          score += 2;
-        }
-
-        if (getAttendanceColumns(table)) {
-          score += 20;
-        }
+        if (text.includes("attendance")) score += 5;
+        if (text.includes("course") || text.includes("subject")) score += 2;
+        if (getAttendanceColumns(table)) score += 20;
 
         score += rows.reduce((sum, row) => {
           const rowText = normalizeWhitespace(row.textContent ?? "");
@@ -165,79 +175,109 @@ async function fallbackScrapeWithScripting(tabId: number) {
         return score;
       };
 
-      const tables = Array.from(document.querySelectorAll("table"));
-      const attendanceTable = tables
-        .map((table) => ({ table, score: scoreAttendanceTable(table) }))
-        .sort((a, b) => b.score - a.score)[0]?.table ?? null;
+      const attendanceTable =
+        Array.from(document.querySelectorAll("table"))
+          .map((table) => ({ table, score: scoreAttendanceTable(table) }))
+          .filter((entry) => entry.score > 0)
+          .sort((a, b) => b.score - a.score)[0]?.table ?? null;
 
-      const attendanceColumns = attendanceTable
-        ? getAttendanceColumns(attendanceTable)
-        : null;
+      const attendanceColumns = attendanceTable ? getAttendanceColumns(attendanceTable) : null;
 
       const subjects = attendanceTable
-        ? getRows(attendanceTable)
-            .flatMap((row) => {
-              const cells = Array.from(row.querySelectorAll("td")).map((cell) =>
-                normalizeWhitespace(cell.textContent ?? ""),
-              );
-              if (cells.length < 3) {
-                return [];
-              }
+        ? getRows(attendanceTable).flatMap((row) => {
+            const cells = Array.from(row.querySelectorAll("td")).map((cell) =>
+              normalizeWhitespace(cell.textContent ?? ""),
+            );
+            if (cells.length < 3) {
+              return [];
+            }
 
-              if (attendanceColumns) {
-                const code = cells[attendanceColumns.code] ?? "";
-                const courseName = cells[attendanceColumns.name] ?? "";
-                const attendedClasses = asCount(cells[attendanceColumns.attended] ?? "");
-                const heldClasses = asCount(cells[attendanceColumns.held] ?? "");
-                if (
-                  code &&
-                  courseName &&
-                  /[A-Za-z]/.test(code) &&
-                  /[A-Za-z]/.test(courseName) &&
-                  attendedClasses !== null &&
-                  heldClasses !== null
-                ) {
-                  const percentage = attendanceColumns.percentage >= 0
-                    ? cells[attendanceColumns.percentage] ?? ""
+            if (attendanceColumns) {
+              const code = cells[attendanceColumns.code] ?? "";
+              const courseName = cells[attendanceColumns.name] ?? "";
+              const attendedClasses = asCount(cells[attendanceColumns.attended] ?? "");
+              const heldClasses = asCount(cells[attendanceColumns.held] ?? "");
+              if (
+                code &&
+                courseName &&
+                /[A-Za-z]/.test(code) &&
+                /[A-Za-z]/.test(courseName) &&
+                attendedClasses !== null &&
+                heldClasses !== null
+              ) {
+                const percentage =
+                  attendanceColumns.percentage >= 0
+                    ? (cells[attendanceColumns.percentage] ?? "")
                     : "";
-                  return [{
-                    code,
-                    name: courseName,
-                    attendedClasses,
-                    heldClasses,
-                    attendancePercent: percentage ? Number(percentage.replace(/[^\d.]/g, "")) : undefined,
-                  }];
-                }
-                return [];
-              }
-
-              const [code, courseName, attendanceCount, percentage = ""] = cells;
-              const counts = parseAttendanceCount(attendanceCount);
-              if (code && courseName && counts) {
                 return [{
                   code,
                   name: courseName,
-                  attendedClasses: counts.attendedClasses,
-                  heldClasses: counts.heldClasses,
-                  attendancePercent: percentage ? Number(percentage.replace(/[^\d.]/g, "")) : undefined,
+                  attendedClasses,
+                  heldClasses,
+                  attendancePercent: percentage
+                    ? Number(percentage.replace(/[^\d.]/g, ""))
+                    : undefined,
                 }];
               }
-
               return [];
-            })
+            }
+
+            const [code, courseName, attendanceCount, percentage = ""] = cells;
+            const counts = parseAttendanceCount(attendanceCount);
+            if (code && courseName && counts) {
+              return [{
+                code,
+                name: courseName,
+                attendedClasses: counts.attendedClasses,
+                heldClasses: counts.heldClasses,
+                attendancePercent: percentage
+                  ? Number(percentage.replace(/[^\d.]/g, ""))
+                  : undefined,
+              }];
+            }
+
+            return [];
+          })
         : [];
 
-      const semesterSelect = Array.from(document.querySelectorAll("select")).find(
-        (select) => Array.from(select.options).some(
-          (option) => /^SEM(?:ESTER)?[-\s]/i.test(option.text.trim()),
-        ),
-      );
-      const studentName = normalizeWhitespace(
-        document.querySelector<HTMLAnchorElement>('a[href*="stu_studentProfile"]')?.textContent ?? "",
-      );
-      const student = {
-        studentName: studentName || undefined,
-        semesterLabel: semesterSelect?.selectedOptions[0]?.text.trim() || undefined,
+      let sessionExpired = false;
+
+      // An expired ERP session serves the login page with HTTP 200, so a
+      // status check alone would treat HTML as valid data.
+      const fetchJson = async (path: string): Promise<unknown> => {
+        const response = await fetch(path, {
+          credentials: "include",
+          headers: {
+            Accept: "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+          },
+        });
+
+        if (response.status === 401 || response.status === 403) {
+          sessionExpired = true;
+          return null;
+        }
+        if (!response.ok) {
+          return null;
+        }
+
+        const body = await response.text();
+        if (/^\s*(<!doctype|<html)/i.test(body)) {
+          if (/login|j_spring_security|signin/i.test(body)) {
+            sessionExpired = true;
+          }
+          return null;
+        }
+        if (body.trim() === "") {
+          return null;
+        }
+
+        try {
+          const parsed = JSON.parse(body);
+          return typeof parsed === "string" ? JSON.parse(parsed) : parsed;
+        } catch {
+          return null;
+        }
       };
 
       const toDateKey = (date: Date) => {
@@ -253,42 +293,28 @@ async function fallbackScrapeWithScripting(tabId: number) {
       };
 
       const parsePortalDate = (dateText?: string) => {
-        if (!dateText) {
-          return null;
-        }
+        if (!dateText) return null;
         const match = dateText.trim().match(/^([A-Za-z]{3})\s+(\d{1,2}),\s*(\d{4})$/);
-        if (!match) {
-          return null;
-        }
-        const monthNames = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+        if (!match) return null;
+        const monthNames = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
         const monthIndex = monthNames.indexOf(match[1].toLowerCase());
-        if (monthIndex < 0) {
-          return null;
-        }
+        if (monthIndex < 0) return null;
         return new Date(Number(match[3]), monthIndex, Number(match[2]));
       };
 
       const normalizeTime = (raw?: string) => {
         const value = raw?.trim();
-        if (!value) {
-          return null;
-        }
+        if (!value) return null;
         const match = value.match(/^(\d{1,2}):(\d{2})/);
-        if (!match) {
-          return null;
-        }
+        if (!match) return null;
         return `${match[1].padStart(2, "0")}:${match[2]}`;
       };
 
-      const deriveSubjectCode = (row: any) => {
+      const deriveSubjectCode = (row: Record<string, string | undefined>) => {
         const shortName = row.subShortName?.trim();
-        if (shortName) {
-          return shortName;
-        }
+        if (shortName) return shortName;
         const suffix = row.subjectId?.split("-").at(-1)?.trim();
-        if (suffix) {
-          return suffix;
-        }
+        if (suffix) return suffix;
         const match = (row.subjectName ?? row.subName ?? "").match(/[A-Z]{2,}\d+[A-Z0-9]*/i);
         return match?.[0] ?? "unknown";
       };
@@ -298,55 +324,53 @@ async function fallbackScrapeWithScripting(tabId: number) {
       const end = new Date(start);
       end.setDate(end.getDate() + TIMETABLE_RANGE_DAYS);
 
-      const todayPromise = fetch(
-        `/stu_getTodaysScheduleForStudentLoggedIn.json?date=${encodeURIComponent(formatPortalDate(start))}`,
-        { credentials: "include", headers: { Accept: "application/json, text/plain, */*" } },
-      ).then((response) => response.ok ? response.json() : []);
+      const [todayPayload, rangePayload, academicPayload] = await Promise.all([
+        fetchJson(`/stu_getTodaysScheduleForStudentLoggedIn.json?date=${encodeURIComponent(formatPortalDate(start))}`),
+        fetchJson(`/getBetweenDatesTimetableForStudent.json?startDate=${encodeURIComponent(formatPortalDate(start))}&endDate=${encodeURIComponent(formatPortalDate(end))}`),
+        fetchJson("/stu_getAcademicInformationNew.json"),
+      ]);
 
-      const rangePromise = fetch(
-        `/getBetweenDatesTimetableForStudent.json?startDate=${encodeURIComponent(formatPortalDate(start))}&endDate=${encodeURIComponent(formatPortalDate(end))}`,
-        { credentials: "include", headers: { Accept: "application/json, text/plain, */*" } },
-      ).then((response) => response.ok ? response.json() : []);
+      const rows = Array.isArray(rangePayload)
+        ? (rangePayload as Array<Record<string, string | undefined>>)
+        : [];
 
-      const [todayPayload, rangePayload] = await Promise.all([todayPromise, rangePromise]);
-      const rows = Array.isArray(rangePayload) ? rangePayload : [];
+      const calendarSessions = rows
+        .flatMap((row, index) => {
+          const parsedDate = parsePortalDate(row.lectureDate);
+          const startTime = normalizeTime(row.startTimeHM ?? row.lStartTime);
+          const endTime = normalizeTime(row.endTimeHM ?? row.lEndTime);
+          const subjectCode = deriveSubjectCode(row);
+          if (!parsedDate || !startTime || !endTime || !subjectCode) {
+            return [];
+          }
+          const dateKey = toDateKey(parsedDate);
+          const subjectId = subjectCode.toLowerCase();
+          return [{
+            id: `${subjectId}:${dateKey}:${startTime}:${index}`,
+            subjectId,
+            subjectCode,
+            subjectName: row.subjectName?.trim() || row.subName?.trim() || subjectCode,
+            date: dateKey,
+            dayOfWeek: parsedDate.getDay(),
+            startTime,
+            endTime,
+            room: row.roomNo?.trim() || row.roomName?.trim() || undefined,
+            faculty: row.employeeName1?.trim() || undefined,
+            source: "portal" as const,
+          }];
+        })
+        .sort((a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime));
 
-      const calendarSessions = rows.flatMap((row: any, index: number) => {
-        const parsedDate = parsePortalDate(row.lectureDate);
-        const startTime = normalizeTime(row.startTimeHM ?? row.lStartTime);
-        const endTime = normalizeTime(row.endTimeHM ?? row.lEndTime);
-        const subjectCode = deriveSubjectCode(row);
-        if (!parsedDate || !startTime || !endTime || !subjectCode) {
-          return [];
-        }
-        const dateKey = toDateKey(parsedDate);
-        const subjectId = subjectCode.toLowerCase();
-        return [{
-          id: `${subjectId}:${dateKey}:${startTime}:${index}`,
-          subjectId,
-          subjectCode,
-          subjectName: row.subjectName?.trim() || row.subName?.trim() || subjectCode,
-          date: dateKey,
-          dayOfWeek: parsedDate.getDay(),
-          startTime,
-          endTime,
-          room: row.roomNo?.trim() || row.roomName?.trim() || undefined,
-          faculty: row.employeeName1?.trim() || undefined,
-          source: "portal" as const,
-        }];
-      }).sort((a: any, b: any) =>
-        a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime),
-      );
-
-      const timetableMap = new Map<string, any>();
-      calendarSessions.forEach((session: any) => {
-        const key = [
-          session.subjectId,
-          session.dayOfWeek,
-          session.startTime,
-          session.endTime,
-          session.room ?? "",
-        ].join("|");
+      const timetableMap = new Map<string, {
+        id: string;
+        subjectId: string;
+        dayOfWeek: number;
+        startTime: string;
+        endTime: string;
+        room?: string;
+      }>();
+      calendarSessions.forEach((session) => {
+        const key = [session.subjectId, session.dayOfWeek, session.startTime, session.endTime, session.room ?? ""].join("|");
         if (!timetableMap.has(key)) {
           timetableMap.set(key, {
             id: `slot:${session.subjectId}:${session.dayOfWeek}:${session.startTime}:${session.endTime}`,
@@ -359,9 +383,30 @@ async function fallbackScrapeWithScripting(tabId: number) {
         }
       });
 
+      const info = (academicPayload as { AcademicInfo?: Record<string, string> } | null)?.AcademicInfo;
+      const clean = (value?: string) => {
+        const trimmed = value?.trim();
+        return trimmed && trimmed !== "null" ? trimmed : undefined;
+      };
+
+      const semesterSelect = Array.from(document.querySelectorAll("select")).find((select) =>
+        Array.from(select.options).some((option) => /^SEM(?:ESTER)?[-\s]/i.test(option.text.trim())),
+      );
+      const studentName = normalizeWhitespace(
+        document.querySelector<HTMLAnchorElement>('a[href*="stu_studentProfile"]')?.textContent ?? "",
+      );
+
+      const student = {
+        studentName: studentName || undefined,
+        semesterLabel: clean(info?.semesterName) ?? semesterSelect?.selectedOptions[0]?.text.trim() ?? undefined,
+        branch: clean(info?.courseName),
+        section: clean(info?.divisionName),
+        rollNo: clean(info?.rollNo),
+      };
+
       const holidayMessage =
-        Array.isArray(todayPayload) && todayPayload[0]?.holiday
-          ? `Today is marked as ${todayPayload[0].holiday}.`
+        Array.isArray(todayPayload) && (todayPayload[0] as { holiday?: string })?.holiday
+          ? `Today is marked as ${(todayPayload[0] as { holiday?: string }).holiday}.`
           : undefined;
 
       return {
@@ -370,12 +415,13 @@ async function fallbackScrapeWithScripting(tabId: number) {
         calendarSessions,
         rangeStart: toDateKey(start),
         rangeEnd: toDateKey(end),
+        sessionExpired,
         message:
           calendarSessions.length > 0
             ? holidayMessage
-              ? `Imported ${calendarSessions.length} upcoming classes. ${holidayMessage}`
-              : `Imported ${calendarSessions.length} upcoming classes from the portal.`
-            : holidayMessage ?? "The portal returned no upcoming classes in the selected range.",
+              ? `Synced ${calendarSessions.length} upcoming classes. ${holidayMessage}`
+              : `Synced ${calendarSessions.length} upcoming classes.`
+            : (holidayMessage ?? "The portal returned no upcoming classes in this range."),
         student,
       };
     },
@@ -388,33 +434,47 @@ async function scrapeActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
 
   if (!tab?.id) {
-    throw new Error("Open the NIET ERP attendance page, then try again.");
+    throw new Error("Open your NIET ERP attendance page, then try again.");
   }
 
   if (!tab.url?.includes("nietcloud.niet.co.in")) {
-    throw new Error("The active tab is not a NIET ERP page.");
+    throw new Error("Open your NIET ERP attendance page to refresh.");
   }
 
   try {
     const response = await chrome.tabs.sendMessage(tab.id, { type: "SCRAPE_ATTENDANCE" });
     if (!response?.success) {
-      throw new Error(response?.error ?? "Could not scrape attendance from the active tab.");
+      throw new Error(response?.error ?? "Could not read attendance from this page.");
     }
     return getDashboardData();
-  } catch (_error) {
+  } catch {
+    // Content script absent or not yet injected — read the page directly.
     const fallback = await fallbackScrapeWithScripting(tab.id);
     if (!fallback) {
-      throw new Error("Could not scrape attendance from the active tab.");
+      throw new Error("Could not read attendance from this page.");
+    }
+
+    if (fallback.sessionExpired) {
+      await saveTimetableSyncError(
+        "Your NIET ERP session expired. Sign in again to refresh.",
+        "session-expired",
+      );
+      throw new Error("Your NIET ERP session expired. Sign in again to refresh.");
+    }
+
+    if (fallback.student) {
+      await saveStudentProfile(fallback.student as Partial<StudentProfile>);
     }
 
     if (fallback.subjects.length > 0) {
-      const snapshot = buildSnapshot(
-        fallback.subjects,
-        `Fallback-scraped from ${tab.url}`,
-        [],
-        fallback.student,
+      await saveErpSnapshot(
+        buildSnapshot(
+          fallback.subjects,
+          `Read from ${tab.url}`,
+          [],
+          fallback.student,
+        ),
       );
-      await saveErpSnapshot(snapshot);
     }
 
     if (fallback.calendarSessions.length > 0 || fallback.timetable.length > 0) {
@@ -431,44 +491,60 @@ async function scrapeActiveTab() {
   return getDashboardData();
 }
 
+/** Broadcasts an overlay preference change to every open ERP tab. */
+async function broadcastOverlayPreference(enabled: boolean) {
+  const tabs = await chrome.tabs.query({ url: "*://nietcloud.niet.co.in/*" });
+  await Promise.all(
+    tabs.map((tab) =>
+      tab.id
+        ? chrome.tabs
+            .sendMessage(tab.id, { type: "SET_OVERLAY_ENABLED", payload: enabled })
+            .catch(() => {})
+        : Promise.resolve(),
+    ),
+  );
+}
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  const { type, payload } = message;
+  const { type, payload } = message ?? {};
 
   switch (type) {
     case "ATTENDANCE_SCRAPED": {
-      const snapshot = payload as ERPImportSnapshot;
-      saveErpSnapshot(snapshot)
+      saveErpSnapshot(payload as ERPImportSnapshot)
         .then((dashboard) => {
-          updateBadge();
+          void updateBadge();
           sendResponse({ success: true, dashboard });
         })
-        .catch((error) => {
-          sendResponse({ success: false, error: String(error) });
-        });
+        .catch((error) => sendResponse({ success: false, error: String(error) }));
+      return true;
+    }
+
+    case "STUDENT_PROFILE_DETECTED": {
+      saveStudentProfile(payload as Partial<StudentProfile>)
+        .then((dashboard) => sendResponse({ success: true, dashboard }))
+        .catch((error) => sendResponse({ success: false, error: String(error) }));
       return true;
     }
 
     case "PORTAL_TIMETABLE_SCRAPED": {
       savePortalTimetable(payload)
         .then((dashboard) => {
-          updateBadge();
+          void updateBadge();
           sendResponse({ success: true, dashboard });
         })
-        .catch((error) => {
-          sendResponse({ success: false, error: String(error) });
-        });
+        .catch((error) => sendResponse({ success: false, error: String(error) }));
       return true;
     }
 
     case "PORTAL_TIMETABLE_ERROR": {
-      saveTimetableSyncError(String(payload ?? "Portal timetable sync failed."))
-        .then((dashboard) => {
-          updateBadge();
-          sendResponse({ success: true, dashboard });
-        })
-        .catch((error) => {
-          sendResponse({ success: false, error: String(error) });
-        });
+      const detail =
+        typeof payload === "string"
+          ? { message: payload, status: "error" as const }
+          : (payload as { message: string; status: "error" | "session-expired" });
+
+      saveTimetableSyncError(detail.message, detail.status)
+        .then((dashboard) => sendResponse({ success: true, dashboard }))
+        .catch((error) => sendResponse({ success: false, error: String(error) }));
       return true;
     }
 
@@ -479,23 +555,42 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return true;
     }
 
-    case "SCRAPE_ACTIVE_TAB": {
-      scrapeActiveTab()
+    case "GET_PREFERENCES": {
+      readStore()
+        .then((store) => sendResponse({ success: true, preferences: store.preferences }))
+        .catch((error) => sendResponse({ success: false, error: String(error) }));
+      return true;
+    }
+
+    case "SET_OVERLAY_PREFERENCE": {
+      const enabled = Boolean(payload);
+      setOverlayPreference(enabled)
         .then((dashboard) => {
-          updateBadge();
+          void broadcastOverlayPreference(enabled);
           sendResponse({ success: true, dashboard });
         })
         .catch((error) => sendResponse({ success: false, error: String(error) }));
       return true;
     }
 
-    case "RUN_SIMULATION": {
-      const request = payload as SimulationRequest;
-      saveSimulation(request)
-        .then((result) => {
-          updateBadge();
-          sendResponse({ success: true, result });
+    case "SCRAPE_ACTIVE_TAB": {
+      scrapeActiveTab()
+        .then((dashboard) => {
+          void updateBadge();
+          sendResponse({ success: true, dashboard });
         })
+        .catch((error) =>
+          sendResponse({
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      return true;
+    }
+
+    case "RUN_SIMULATION": {
+      saveSimulation(payload as SimulationRequest)
+        .then((result) => sendResponse({ success: true, result }))
         .catch((error) => sendResponse({ success: false, error: String(error) }));
       return true;
     }
@@ -503,7 +598,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     case "SAVE_SUBJECTS": {
       replaceSubjects(payload)
         .then((dashboard) => {
-          updateBadge();
+          void updateBadge();
           sendResponse({ success: true, dashboard });
         })
         .catch((error) => sendResponse({ success: false, error: String(error) }));
@@ -513,7 +608,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     case "SAVE_TIMETABLE": {
       replaceTimetable(payload)
         .then((dashboard) => {
-          updateBadge();
+          void updateBadge();
           sendResponse({ success: true, dashboard });
         })
         .catch((error) => sendResponse({ success: false, error: String(error) }));
@@ -521,10 +616,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
 
     case "IMPORT_PASTED": {
-      const pastedSnapshot = payload as ERPImportSnapshot;
-      saveErpSnapshot(pastedSnapshot)
+      saveErpSnapshot(payload as ERPImportSnapshot)
         .then((dashboard) => {
-          updateBadge();
+          void updateBadge();
           sendResponse({ success: true, dashboard });
         })
         .catch((error) => sendResponse({ success: false, error: String(error) }));
@@ -543,10 +637,5 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 });
 
-chrome.runtime.onInstalled.addListener(() => {
-  updateBadge();
-});
-
-chrome.runtime.onStartup.addListener(() => {
-  updateBadge();
-});
+chrome.runtime.onInstalled.addListener(() => void updateBadge());
+chrome.runtime.onStartup.addListener(() => void updateBadge());

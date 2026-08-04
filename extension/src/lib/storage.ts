@@ -1,11 +1,12 @@
 /**
- * Storage layer — wraps chrome.storage.local with typed access
- * for the AttendanceStore and computed DashboardData.
+ * Storage layer — typed wrapper over chrome.storage.local for the
+ * AttendanceStore and the computed DashboardData.
+ *
+ * Everything here stays on the student's machine. Nothing is transmitted.
  */
 
 import { buildDashboardData, simulateAttendance } from "@/lib/attendance-engine";
 import type {
-  AttendanceAdjustment,
   AttendancePolicy,
   AttendanceStore,
   CalendarSession,
@@ -14,71 +15,80 @@ import type {
   ScheduleSlot,
   SimulationRequest,
   SimulationResult,
+  StudentProfile,
   Subject,
 } from "@/lib/types";
 
 const STORE_KEY = "attendance_store";
+const MAX_SNAPSHOTS = 50;
+const MAX_SIMULATIONS = 25;
 
+/** NIET Attendance Policy 2025-26: 75% per subject, 60% floor for condonation. */
 const DEFAULT_POLICY: AttendancePolicy = {
   thresholdPercent: 75,
   severeMedicalFloorPercent: 60,
-  weightageByCategory: {
-    normal: 1,
-    seminar: 1,
-    remedial: 1,
-    sessional: 1,
-    "technical-event": 1,
-    "severe-medical": 0.15,
-    curricular: 0,
-    placement: 1,
-    manual: 1,
-  },
 };
+
+function defaultStudent(): StudentProfile {
+  return {
+    institute: "NIET Greater Noida",
+    studentName: "",
+    branch: "",
+    section: "",
+    semesterLabel: "",
+    rollNo: "",
+    studentEmail: "",
+  };
+}
 
 function defaultStore(): AttendanceStore {
   return {
-    student: {
-      institute: "NIET Greater Noida",
-      studentName: "",
-      branch: "",
-      semesterLabel: "",
-      studentEmail: "",
-    },
+    student: defaultStudent(),
     policy: DEFAULT_POLICY,
     subjects: [],
     timetable: [],
     calendarSessions: [],
-    timetableSync: {
-      source: "none",
-      status: "idle",
-    },
-    adjustments: [],
+    timetableSync: { source: "none", status: "idle" },
     simulations: [],
     erpSnapshots: [],
+    activeSemesterLabel: "",
+    preferences: { showPageOverlay: true },
+  };
+}
+
+/**
+ * Fills in anything missing from a stored object so upgrades from an older
+ * shape (or a partially-written store) cannot crash the dashboard.
+ */
+function migrate(stored: Partial<AttendanceStore>): AttendanceStore {
+  const base = defaultStore();
+
+  return {
+    student: { ...base.student, ...(stored.student ?? {}) },
+    policy: { ...base.policy, ...(stored.policy ?? {}) },
+    subjects: stored.subjects ?? [],
+    timetable: stored.timetable ?? [],
+    calendarSessions: stored.calendarSessions ?? [],
+    timetableSync:
+      stored.timetableSync ??
+      (stored.timetable && stored.timetable.length > 0
+        ? { source: "manual", status: "ready" }
+        : base.timetableSync),
+    simulations: stored.simulations ?? [],
+    erpSnapshots: stored.erpSnapshots ?? [],
+    activeSemesterLabel:
+      stored.activeSemesterLabel ?? stored.student?.semesterLabel ?? "",
+    preferences: { ...base.preferences, ...(stored.preferences ?? {}) },
   };
 }
 
 export async function readStore(): Promise<AttendanceStore> {
   const result = await chrome.storage.local.get(STORE_KEY);
+
   if (result[STORE_KEY]) {
-    const store = result[STORE_KEY] as AttendanceStore;
-    if (!store.student) {
-      store.student = defaultStore().student;
-    }
-    if (!store.student.studentName) {
-      store.student.studentName = "";
-    }
-    if (!store.calendarSessions) {
-      store.calendarSessions = [];
-    }
-    if (!store.timetableSync) {
-      store.timetableSync = {
-        source: store.timetable.length > 0 ? "manual" : "none",
-        status: store.timetable.length > 0 ? "ready" : "idle",
-      };
-    }
-    return store;
+    return migrate(result[STORE_KEY] as Partial<AttendanceStore>);
   }
+
   const store = defaultStore();
   await chrome.storage.local.set({ [STORE_KEY]: store });
   return store;
@@ -90,8 +100,6 @@ export async function writeStore(store: AttendanceStore): Promise<void> {
 
 export async function getDashboardData(): Promise<DashboardData> {
   const store = await readStore();
-  const recentSimulation = store.simulations.at(-1)?.result;
-  const erpSnapshot = store.erpSnapshots?.at(-1);
 
   return buildDashboardData({
     student: store.student,
@@ -100,9 +108,8 @@ export async function getDashboardData(): Promise<DashboardData> {
     timetable: store.timetable,
     calendarSessions: store.calendarSessions,
     timetableSync: store.timetableSync,
-    adjustments: store.adjustments,
-    recentSimulation,
-    erpSnapshot,
+    recentSimulation: store.simulations.at(-1)?.result,
+    erpSnapshot: store.erpSnapshots.at(-1),
   });
 }
 
@@ -113,7 +120,9 @@ export async function replaceSubjects(subjects: Subject[]): Promise<DashboardDat
   return getDashboardData();
 }
 
-export async function replaceTimetable(timetable: ScheduleSlot[]): Promise<DashboardData> {
+export async function replaceTimetable(
+  timetable: ScheduleSlot[],
+): Promise<DashboardData> {
   const store = await readStore();
   store.timetable = timetable;
   store.calendarSessions = [];
@@ -127,6 +136,17 @@ export async function replaceTimetable(timetable: ScheduleSlot[]): Promise<Dashb
   return getDashboardData();
 }
 
+export async function setOverlayPreference(enabled: boolean): Promise<DashboardData> {
+  const store = await readStore();
+  store.preferences.showPageOverlay = enabled;
+  await writeStore(store);
+  return getDashboardData();
+}
+
+function normalizeCode(code: string) {
+  return code.replace(/[^a-z0-9]/gi, "").toLowerCase();
+}
+
 export async function savePortalTimetable(args: {
   timetable: ScheduleSlot[];
   calendarSessions: CalendarSession[];
@@ -135,57 +155,41 @@ export async function savePortalTimetable(args: {
   message?: string;
 }): Promise<DashboardData> {
   const store = await readStore();
-  const existingByCode = new Map(
-    store.subjects.map((subject) => [
-      subject.code.replace(/[^a-z0-9]/gi, "").toLowerCase(),
-      subject,
-    ]),
+
+  const byCode = new Map(
+    store.subjects.map((subject) => [normalizeCode(subject.code), subject]),
   );
 
-  const resolveSubjectId = (session: CalendarSession) => {
-    const normalizedCode = session.subjectCode.replace(/[^a-z0-9]/gi, "").toLowerCase();
-    const direct = existingByCode.get(normalizedCode);
+  /**
+   * The timetable feed and the attendance table name subjects differently, so
+   * match on an exact normalised code first, then on a prefix either way
+   * ("CS301" vs "CS301A"). Falls back to the feed's own id.
+   */
+  const resolveSubjectId = (subjectCode: string, fallbackId: string) => {
+    const normalized = normalizeCode(subjectCode);
+    const direct = byCode.get(normalized);
     if (direct) {
       return direct.id;
     }
 
-    for (const [code, subject] of existingByCode.entries()) {
-      if (
-        code.startsWith(normalizedCode) ||
-        normalizedCode.startsWith(code)
-      ) {
+    for (const [code, subject] of byCode.entries()) {
+      if (code.startsWith(normalized) || normalized.startsWith(code)) {
         return subject.id;
       }
     }
 
-    return session.subjectId;
+    return fallbackId;
   };
 
   const reconciledSessions = args.calendarSessions.map((session) => ({
     ...session,
-    subjectId: resolveSubjectId(session),
+    subjectId: resolveSubjectId(session.subjectCode, session.subjectId),
   }));
 
+  // Weekly slots carry a subject code in subjectId (set by the content script).
   store.timetable = args.timetable.map((slot) => ({
     ...slot,
-    subjectId:
-      reconciledSessions.find(
-        (session) =>
-          session.dayOfWeek === slot.dayOfWeek &&
-          session.startTime === slot.startTime &&
-          session.endTime === slot.endTime &&
-          session.subjectId === slot.subjectId,
-      )?.subjectId ?? resolveSubjectId({
-        id: slot.id,
-        subjectId: slot.subjectId,
-        subjectCode: slot.subjectId,
-        subjectName: slot.subjectId,
-        date: args.rangeStart,
-        dayOfWeek: slot.dayOfWeek,
-        startTime: slot.startTime,
-        endTime: slot.endTime,
-        source: "manual",
-      }),
+    subjectId: resolveSubjectId(slot.subjectId, slot.subjectId),
   }));
   store.calendarSessions = reconciledSessions;
   store.timetableSync = {
@@ -200,38 +204,38 @@ export async function savePortalTimetable(args: {
         ? `Imported ${args.calendarSessions.length} upcoming classes from the portal.`
         : "No upcoming classes were returned by the portal."),
   };
+
   await writeStore(store);
   return getDashboardData();
 }
 
-export async function saveTimetableSyncError(message: string): Promise<DashboardData> {
+export async function saveTimetableSyncError(
+  message: string,
+  status: "error" | "session-expired" = "error",
+): Promise<DashboardData> {
   const store = await readStore();
-  store.calendarSessions = [];
+  // Keep previously synced sessions: stale dates beat no dates, and clearing
+  // them would silently zero out the student's safe-leave-day estimate.
   store.timetableSync = {
-    source: store.timetable.length > 0 ? "manual" : "portal",
-    status: "error",
-    lastSyncedAt: new Date().toISOString(),
+    ...store.timetableSync,
+    source: store.timetable.length > 0 ? store.timetableSync.source : "portal",
+    status,
+    lastSyncedAt: store.timetableSync.lastSyncedAt,
     message,
   };
   await writeStore(store);
   return getDashboardData();
 }
 
-export async function addAdjustment(adjustment: AttendanceAdjustment): Promise<DashboardData> {
-  const store = await readStore();
-  store.adjustments.push(adjustment);
-  await writeStore(store);
-  return getDashboardData();
-}
-
-export async function saveSimulation(request: SimulationRequest): Promise<SimulationResult> {
+export async function saveSimulation(
+  request: SimulationRequest,
+): Promise<SimulationResult> {
   const store = await readStore();
   const result = simulateAttendance({
     policy: store.policy,
     subjects: store.subjects,
     timetable: store.timetable,
     calendarSessions: store.calendarSessions,
-    adjustments: store.adjustments,
     request,
   });
 
@@ -241,55 +245,117 @@ export async function saveSimulation(request: SimulationRequest): Promise<Simula
     request,
     result,
   });
+  store.simulations = store.simulations.slice(-MAX_SIMULATIONS);
 
   await writeStore(store);
   return result;
 }
 
-export async function saveErpSnapshot(snapshot: ERPImportSnapshot): Promise<DashboardData> {
+function inferSubjectType(name: string): Subject["type"] {
+  if (/\blab\b|practical|workshop/i.test(name)) {
+    return "lab";
+  }
+  if (/mooc|nptel/i.test(name)) {
+    return "other";
+  }
+  return "theory";
+}
+
+/**
+ * Commits a scraped snapshot.
+ *
+ * The ERP has a semester dropdown, so the table on screen is not necessarily
+ * the current semester. Subjects are only replaced when the snapshot's
+ * semester matches the active one; otherwise the snapshot is archived and
+ * live state is left alone. Without this, browsing last semester's attendance
+ * silently destroys the current semester's data.
+ */
+export async function saveErpSnapshot(
+  snapshot: ERPImportSnapshot,
+): Promise<DashboardData> {
   const store = await readStore();
+
+  store.erpSnapshots.push(snapshot);
+  store.erpSnapshots = store.erpSnapshots.slice(-MAX_SNAPSHOTS);
+
+  const snapshotSemester = snapshot.student?.semesterLabel?.trim() ?? "";
+  const activeSemester = store.activeSemesterLabel.trim();
+
+  const isHistoricalView =
+    snapshotSemester !== "" && activeSemester !== "" && snapshotSemester !== activeSemester;
+
+  if (isHistoricalView) {
+    await writeStore(store);
+    return getDashboardData();
+  }
 
   if (snapshot.student?.studentName) {
     store.student.studentName = snapshot.student.studentName;
   }
   if (snapshot.student?.semesterLabel) {
     store.student.semesterLabel = snapshot.student.semesterLabel;
+    store.activeSemesterLabel = snapshot.student.semesterLabel;
   }
   if (snapshot.student?.branch) {
     store.student.branch = snapshot.student.branch;
   }
-
-  if (!store.erpSnapshots) {
-    store.erpSnapshots = [];
+  if (snapshot.student?.section) {
+    store.student.section = snapshot.student.section;
   }
-  store.erpSnapshots.push(snapshot);
-  store.erpSnapshots = store.erpSnapshots.slice(-50);
+  if (snapshot.student?.rollNo) {
+    store.student.rollNo = snapshot.student.rollNo;
+  }
 
-  const existingByCode = new Map(
-    store.subjects.map((s) => [s.code.toLowerCase(), s])
-  );
+  // Subject ids are namespaced by semester because course codes repeat across
+  // terms and would otherwise collide with stale calendar sessions.
+  const semesterKey = normalizeCode(store.activeSemesterLabel || "current");
+  const subjectIdFor = (code: string) => `${semesterKey}:${normalizeCode(code)}`;
 
-  store.subjects = snapshot.parsedSubjects.map((s) => {
-    const existing = existingByCode.get(s.code.toLowerCase());
+  const existingById = new Map(store.subjects.map((subject) => [subject.id, subject]));
+
+  store.subjects = snapshot.parsedSubjects.map((parsed) => {
+    const id = subjectIdFor(parsed.code);
+    const existing = existingById.get(id);
+
     return {
-      id: existing?.id ?? s.code.toLowerCase(),
-      code: s.code,
-      name: s.name,
-      type: existing?.type ?? (/lab/i.test(s.name) ? "lab" as const : /mooc/i.test(s.name) ? "other" as const : "theory" as const),
-      heldClasses: s.heldClasses,
-      attendedClasses: s.attendedClasses,
+      id,
+      code: parsed.code,
+      name: parsed.name,
+      type: existing?.type ?? inferSubjectType(parsed.name),
+      heldClasses: parsed.heldClasses,
+      attendedClasses: parsed.attendedClasses,
     };
   });
 
-  if (!store.calendarSessions) {
-    store.calendarSessions = [];
+  await writeStore(store);
+  return getDashboardData();
+}
+
+/** Merges portal-derived profile fields without disturbing attendance data. */
+export async function saveStudentProfile(
+  profile: Partial<StudentProfile>,
+): Promise<DashboardData> {
+  const store = await readStore();
+
+  const assignable: Array<keyof StudentProfile> = [
+    "studentName",
+    "branch",
+    "section",
+    "semesterLabel",
+    "rollNo",
+    "studentEmail",
+  ];
+
+  for (const key of assignable) {
+    const value = profile[key];
+    if (typeof value === "string" && value.trim() !== "") {
+      store.student[key] = value.trim();
+    }
   }
 
-  if (!store.timetableSync) {
-    store.timetableSync = {
-      source: "none",
-      status: "idle",
-    };
+  // First profile read of a new term establishes the active semester.
+  if (store.activeSemesterLabel === "" && profile.semesterLabel?.trim()) {
+    store.activeSemesterLabel = profile.semesterLabel.trim();
   }
 
   await writeStore(store);

@@ -1,3 +1,29 @@
+# Dependencies
 node_modules/
+
+# Build output
+dist/
+.next/
+out/
+
+# Secrets — never commit
+*cookies*.txt
+*.cookie
+.env
+.env.*
+!.env.example
+
+# Logs
 *.log
 npm-debug.log*
+yarn-error.log*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Scratch
+tmp-*
+*.tmp

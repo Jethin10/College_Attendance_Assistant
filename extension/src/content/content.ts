@@ -1,9 +1,11 @@
 /**
- * Content Script - runs on nietcloud.niet.co.in
+ * Content script — runs on nietcloud.niet.co.in.
  *
- * Detects the attendance table, keeps watching for SPA-style page updates,
- * injects overlay badges, syncs parsed attendance back to the extension,
- * and auto-imports dated timetable sessions from the NIET portal.
+ * Reads the attendance table, pulls the student's dated schedule and academic
+ * details from the portal's own JSON endpoints (using the session the student
+ * is already signed in with), and injects on-page badges.
+ *
+ * Nothing leaves the browser. Every request here targets the ERP itself.
  */
 
 const OVERLAY_ATTR = "data-niet-planner";
@@ -35,6 +37,14 @@ type CalendarSession = {
   source: "portal" | "manual";
 };
 
+type StudentContext = {
+  studentName?: string;
+  semesterLabel?: string;
+  branch?: string;
+  section?: string;
+  rollNo?: string;
+};
+
 type ERPImportSnapshot = {
   id: string;
   importedAt: string;
@@ -42,11 +52,7 @@ type ERPImportSnapshot = {
   parsedSubjects: ParsedSubject[];
   warnings: string[];
   rawSummary: string;
-  student?: {
-    studentName?: string;
-    semesterLabel?: string;
-    branch?: string;
-  };
+  student?: StudentContext;
 };
 
 type ParsedSubject = {
@@ -72,11 +78,23 @@ type PortalTimetableRow = {
   roomName?: string;
 };
 
+/** Thrown when the portal answers with the login page instead of data. */
+class SessionExpiredError extends Error {
+  constructor() {
+    super("Your NIET ERP session expired. Sign in again to refresh.");
+    this.name = "SessionExpiredError";
+  }
+}
+
 let lastSignature = "";
 let lastTimetableSignature = "";
 let lastTimetableFetchAt = 0;
 let rescanTimer: number | null = null;
 let currentUrl = location.href;
+let overlayEnabled = true;
+let observer: MutationObserver | null = null;
+/** Set while we mutate the DOM ourselves, so the observer ignores our writes. */
+let injecting = false;
 
 function round(value: number, digits = 2) {
   return Number(value.toFixed(digits));
@@ -100,8 +118,7 @@ function computeBunkableClasses(
   }
 
   const thresholdRatio = thresholdPercent / 100;
-  const limit = Math.floor(attended / thresholdRatio - held);
-  return Math.max(0, limit);
+  return Math.max(0, Math.floor(attended / thresholdRatio - held));
 }
 
 function computeRecoveryClassesNeeded(
@@ -111,16 +128,12 @@ function computeRecoveryClassesNeeded(
 ) {
   const thresholdRatio = thresholdPercent / 100;
 
-  if (held <= 0 || attended / held >= thresholdRatio) {
+  if (held <= 0 || thresholdRatio >= 1 || attended / held >= thresholdRatio) {
     return 0;
   }
 
-  let recovery = 0;
-  while ((attended + recovery) / (held + recovery) < thresholdRatio) {
-    recovery += 1;
-  }
-
-  return recovery;
+  const needed = (thresholdRatio * held - attended) / (1 - thresholdRatio);
+  return Math.max(0, Math.ceil(round(needed, 6)));
 }
 
 function getSubjectStatus(
@@ -204,7 +217,13 @@ function getAttendanceColumns(table: ParentNode): AttendanceColumns | null {
     const headers = headerCells.map((cell) => normalizeHeader(cell.textContent ?? ""));
     const columns: AttendanceColumns = {
       code: findHeaderIndex(headers, ["course code", "subject code", "paper code", "code"]),
-      name: findHeaderIndex(headers, ["course name", "subject name", "paper name", "subject", "course"]),
+      name: findHeaderIndex(headers, [
+        "course name",
+        "subject name",
+        "paper name",
+        "subject",
+        "course",
+      ]),
       attended: findHeaderIndex(headers, [
         "present count",
         "present",
@@ -276,11 +295,10 @@ function scoreAttendanceTable(table: HTMLTableElement): number {
 }
 
 function findAttendanceTableInRoot(root: ParentNode): HTMLTableElement | null {
-  const tables = Array.from(root.querySelectorAll("table"));
   let bestTable: HTMLTableElement | null = null;
   let bestScore = 0;
 
-  for (const table of tables) {
+  for (const table of Array.from(root.querySelectorAll("table"))) {
     const score = scoreAttendanceTable(table);
     if (score > bestScore) {
       bestTable = table;
@@ -315,8 +333,7 @@ function parseHeaderMappedRow(
     return null;
   }
 
-  const percentageText =
-    columns.percentage >= 0 ? (cells[columns.percentage] ?? "") : "";
+  const percentageText = columns.percentage >= 0 ? (cells[columns.percentage] ?? "") : "";
 
   return {
     code,
@@ -359,7 +376,7 @@ function parseLegacyRow(cells: string[]): ParsedSubject | null {
     !/\d+\s*\/\s*\d+/.test(cells[codeIndex + 1]) &&
     cells[codeIndex + 1] !== percentageCell
       ? cells[codeIndex + 1]
-      : cells.find((cell) => /[A-Za-z]{3,}/.test(cell) && cell !== codeCell) ?? codeCell;
+      : (cells.find((cell) => /[A-Za-z]{3,}/.test(cell) && cell !== codeCell) ?? codeCell);
 
   return {
     code: codeCell,
@@ -417,7 +434,7 @@ function buildSnapshot(
   parsedSubjects: ParsedSubject[],
   rawSummary: string,
   warnings: string[],
-  student?: ERPImportSnapshot["student"],
+  student?: StudentContext,
 ): ERPImportSnapshot {
   return {
     id: crypto.randomUUID(),
@@ -430,21 +447,20 @@ function buildSnapshot(
   };
 }
 
-function detectStudentContext(): ERPImportSnapshot["student"] {
-  const semesterSelect = Array.from(document.querySelectorAll("select")).find(
-    (select) =>
-      Array.from(select.options).some((option) => /^SEM(?:ESTER)?[-\s]/i.test(option.text.trim())),
+/** Semester shown in the page's own dropdown; used as a fallback. */
+function detectSemesterFromDom(): string | undefined {
+  const semesterSelect = Array.from(document.querySelectorAll("select")).find((select) =>
+    Array.from(select.options).some((option) => /^SEM(?:ESTER)?[-\s]/i.test(option.text.trim())),
   );
-  const semesterLabel = semesterSelect?.selectedOptions[0]?.text.trim();
+
+  return semesterSelect?.selectedOptions[0]?.text.trim() || undefined;
+}
+
+function detectStudentNameFromDom(): string | undefined {
   const profileLink = document.querySelector<HTMLAnchorElement>(
     'a[href*="stu_studentProfile"]',
   );
-  const studentName = normalizeWhitespace(profileLink?.textContent ?? "");
-
-  return {
-    studentName: studentName || undefined,
-    semesterLabel: semesterLabel || undefined,
-  };
+  return normalizeWhitespace(profileLink?.textContent ?? "") || undefined;
 }
 
 function toDateKey(date: Date) {
@@ -469,15 +485,16 @@ function parsePortalDate(dateText?: string) {
     return null;
   }
 
-  const monthNames = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const monthNames = [
+    "jan", "feb", "mar", "apr", "may", "jun",
+    "jul", "aug", "sep", "oct", "nov", "dec",
+  ];
   const monthIndex = monthNames.indexOf(match[1].toLowerCase());
   if (monthIndex < 0) {
     return null;
   }
 
-  const day = Number(match[2]);
-  const year = Number(match[3]);
-  return new Date(year, monthIndex, day);
+  return new Date(Number(match[3]), monthIndex, Number(match[2]));
 }
 
 function normalizePortalDate(dateText?: string) {
@@ -500,9 +517,8 @@ function normalizeTime(raw?: string) {
 }
 
 function subjectSignature() {
-  const subjects = scrapeAttendanceFromDOM();
   return JSON.stringify(
-    subjects.map((subject) => [
+    scrapeAttendanceFromDOM().map((subject) => [
       subject.code,
       subject.name,
       subject.attendedClasses,
@@ -518,45 +534,92 @@ function clearOverlay() {
 function injectOverlayBadges() {
   clearOverlay();
 
+  if (!overlayEnabled) {
+    return;
+  }
+
   const subjects = scrapeAttendanceFromDOM();
   if (subjects.length === 0) {
     return;
   }
 
-  const totalAttended = subjects.reduce((sum, subject) => sum + subject.attendedClasses, 0);
-  const totalHeld = subjects.reduce((sum, subject) => sum + subject.heldClasses, 0);
-  const overallPercent = computeAttendancePercent(totalAttended, totalHeld);
-  const overallBunkable = computeBunkableClasses(totalAttended, totalHeld, THRESHOLD);
-  const overallStatus = getSubjectStatus(overallPercent, THRESHOLD);
   const attendanceTable = findAttendanceTableElement();
+  if (!attendanceTable) {
+    return;
+  }
+
+  const started = subjects.filter((subject) => subject.heldClasses > 0);
+
+  // The binding constraint is the worst subject, not the aggregate: NIET
+  // requires 75% in every subject individually.
+  const headroom = started.map((subject) =>
+    computeBunkableClasses(subject.attendedClasses, subject.heldClasses, THRESHOLD),
+  );
+  const safeToMiss = headroom.length > 0 ? Math.min(...headroom) : 0;
+  const worstPercent =
+    started.length > 0
+      ? Math.min(
+          ...started.map((subject) =>
+            computeAttendancePercent(subject.attendedClasses, subject.heldClasses),
+          ),
+        )
+      : 100;
+  const overallStatus = getSubjectStatus(worstPercent, THRESHOLD);
+
+  const totalAttended = subjects.reduce((sum, s) => sum + s.attendedClasses, 0);
+  const totalHeld = subjects.reduce((sum, s) => sum + s.heldClasses, 0);
+  const overallPercent = computeAttendancePercent(totalAttended, totalHeld);
 
   const summaryBar = document.createElement("div");
   summaryBar.setAttribute(OVERLAY_ATTR, "summary");
   summaryBar.className = "niet-planner-summary";
-  summaryBar.innerHTML = `
-    <div class="niet-planner-summary__inner">
-      <div class="niet-planner-summary__brand">
-        <span class="niet-planner-summary__logo">NIET Attendance</span>
-        <span class="niet-planner-summary__caption">Live help for this table</span>
-      </div>
-      <span class="niet-planner-summary__stat">
-        Overall
-        <strong class="niet-planner-status--${overallStatus}">${overallPercent}%</strong>
-      </span>
-      <span class="niet-planner-summary__stat">
-        Bunkable
-        <strong>${overallBunkable} classes</strong>
-      </span>
-      <span class="niet-planner-summary__stat">
-        Status
-        <strong class="niet-planner-status--${overallStatus}">${overallStatus.toUpperCase()}</strong>
-      </span>
-    </div>
-  `;
-  attendanceTable?.parentElement?.insertBefore(summaryBar, attendanceTable);
 
-  const rows = attendanceTable?.querySelectorAll("tr") ?? [];
-  const columns = attendanceTable ? getAttendanceColumns(attendanceTable) : null;
+  const brand = document.createElement("div");
+  brand.className = "niet-planner-summary__brand";
+  brand.innerHTML = `
+    <span class="niet-planner-summary__logo">Attendance Planner</span>
+    <span class="niet-planner-summary__caption">Lowest subject decides your limit</span>
+  `;
+
+  const stats = document.createElement("div");
+  stats.className = "niet-planner-summary__stats";
+  stats.innerHTML = `
+    <span class="niet-planner-summary__stat">
+      Safe to miss
+      <strong class="niet-planner-status--${overallStatus}">${safeToMiss}</strong>
+    </span>
+    <span class="niet-planner-summary__stat">
+      Lowest subject
+      <strong class="niet-planner-status--${overallStatus}">${worstPercent}%</strong>
+    </span>
+    <span class="niet-planner-summary__stat">
+      Overall
+      <strong>${overallPercent}%</strong>
+    </span>
+  `;
+
+  const dismiss = document.createElement("button");
+  dismiss.className = "niet-planner-summary__dismiss";
+  dismiss.type = "button";
+  dismiss.title = "Hide this bar on ERP pages";
+  dismiss.setAttribute("aria-label", "Hide this bar on ERP pages");
+  dismiss.textContent = "×";
+  dismiss.addEventListener("click", () => {
+    overlayEnabled = false;
+    clearOverlay();
+    chrome.runtime
+      .sendMessage({ type: "SET_OVERLAY_PREFERENCE", payload: false })
+      .catch(() => {});
+  });
+
+  const inner = document.createElement("div");
+  inner.className = "niet-planner-summary__inner";
+  inner.append(brand, stats, dismiss);
+  summaryBar.append(inner);
+
+  attendanceTable.parentElement?.insertBefore(summaryBar, attendanceTable);
+
+  const columns = getAttendanceColumns(attendanceTable);
   const subjectsByKey = new Map(
     subjects.map((subject) => [
       `${subject.code.toLowerCase()}::${subject.name.toLowerCase()}`,
@@ -564,14 +627,14 @@ function injectOverlayBadges() {
     ]),
   );
 
-  rows.forEach((row) => {
+  attendanceTable.querySelectorAll("tr").forEach((row) => {
     const cells = row.querySelectorAll("td");
     if (cells.length < 4) {
       return;
     }
 
     const cellTexts = Array.from(cells).map((cell) =>
-      (cell.textContent ?? "").replace(/\s+/g, " ").trim(),
+      normalizeWhitespace(cell.textContent ?? ""),
     );
     const parsedRow = columns
       ? parseHeaderMappedRow(cellTexts, columns)
@@ -603,43 +666,41 @@ function injectOverlayBadges() {
     );
     const status = getSubjectStatus(percent, THRESHOLD);
 
-    const badge = document.createElement("div");
+    const badge = document.createElement("span");
     badge.setAttribute(OVERLAY_ATTR, "badge");
-    badge.className = `niet-planner-badge niet-planner-badge--${status}`;
 
     if (subject.heldClasses === 0) {
-      badge.className = "niet-planner-badge niet-planner-badge--warning";
-      badge.textContent = "Not started yet";
+      badge.className = "niet-planner-badge niet-planner-badge--neutral";
+      badge.textContent = "Not started";
     } else if (status === "critical") {
-      badge.textContent = `Critical: need ${recovery} to recover`;
+      badge.className = "niet-planner-badge niet-planner-badge--critical";
+      badge.textContent = `Attend ${recovery} to recover`;
     } else if (bunkable === 0) {
-      badge.textContent = "Watch: no bunks left";
+      badge.className = "niet-planner-badge niet-planner-badge--warning";
+      badge.textContent = "No margin left";
     } else {
-      badge.textContent = `${status === "safe" ? "Safe" : "Watch"}: ${bunkable} bunkable`;
+      badge.className = `niet-planner-badge niet-planner-badge--${status}`;
+      badge.textContent = `${bunkable} to spare`;
     }
 
-    const lastCell = cells[cells.length - 1];
-    lastCell.style.position = "relative";
-    lastCell.appendChild(badge);
+    cells[cells.length - 1].appendChild(badge);
   });
 }
 
-async function sendAttendanceToServiceWorker() {
+async function sendAttendanceToServiceWorker(student: StudentContext) {
   const subjects = scrapeAttendanceFromDOM();
   if (subjects.length === 0) {
     return;
   }
 
-  const snapshot = buildSnapshot(
-    subjects,
-    `Auto-scraped from ${window.location.href}`,
-    [],
-    detectStudentContext(),
-  );
-
   await chrome.runtime.sendMessage({
     type: "ATTENDANCE_SCRAPED",
-    payload: snapshot,
+    payload: buildSnapshot(
+      subjects,
+      `Auto-scraped from ${window.location.href}`,
+      [],
+      student,
+    ),
   });
 }
 
@@ -666,7 +727,6 @@ function buildCalendarSessions(rows: PortalTimetableRow[]) {
     const startTime = normalizeTime(row.startTimeHM ?? row.lStartTime);
     const endTime = normalizeTime(row.endTimeHM ?? row.lEndTime);
     const code = deriveSubjectCode(row);
-    const subjectId = code.toLowerCase();
 
     if (!dateKey || !startTime || !endTime || !code) {
       return;
@@ -676,6 +736,8 @@ function buildCalendarSessions(rows: PortalTimetableRow[]) {
     if (dayOfWeek === undefined) {
       return;
     }
+
+    const subjectId = code.toLowerCase();
 
     sessions.push({
       id: `${subjectId}:${dateKey}:${startTime}:${index}`,
@@ -692,13 +754,9 @@ function buildCalendarSessions(rows: PortalTimetableRow[]) {
     });
   });
 
-  return sessions.sort((a, b) => {
-    const byDate = a.date.localeCompare(b.date);
-    if (byDate !== 0) {
-      return byDate;
-    }
-    return a.startTime.localeCompare(b.startTime);
-  });
+  return sessions.sort(
+    (a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime),
+  );
 }
 
 function buildWeeklyTimetable(calendarSessions: CalendarSession[]): ScheduleSlot[] {
@@ -725,15 +783,19 @@ function buildWeeklyTimetable(calendarSessions: CalendarSession[]): ScheduleSlot
     }
   });
 
-  return [...unique.values()].sort((a, b) => {
-    if (a.dayOfWeek !== b.dayOfWeek) {
-      return a.dayOfWeek - b.dayOfWeek;
-    }
-    return a.startTime.localeCompare(b.startTime);
-  });
+  return [...unique.values()].sort(
+    (a, b) => a.dayOfWeek - b.dayOfWeek || a.startTime.localeCompare(b.startTime),
+  );
 }
 
-async function fetchPortalJson(path: string) {
+/**
+ * Fetches JSON from the portal.
+ *
+ * An expired session does NOT 401 here — the ERP serves its login page with
+ * HTTP 200 and an HTML body, so `response.json()` would throw an opaque parse
+ * error. Detect that case explicitly and report it as a session expiry.
+ */
+async function fetchPortalJson(path: string): Promise<unknown> {
   const response = await fetch(path, {
     credentials: "include",
     headers: {
@@ -742,11 +804,88 @@ async function fetchPortalJson(path: string) {
     },
   });
 
+  if (response.status === 401 || response.status === 403) {
+    throw new SessionExpiredError();
+  }
+
   if (!response.ok) {
     throw new Error(`Portal request failed with ${response.status}`);
   }
 
-  return response.json();
+  const body = await response.text();
+  const looksLikeHtml = /^\s*(<!doctype|<html)/i.test(body);
+  const isLoginPage = looksLikeHtml && /login|j_spring_security|signin/i.test(body);
+
+  if (isLoginPage) {
+    throw new SessionExpiredError();
+  }
+
+  if (looksLikeHtml) {
+    throw new Error("The portal returned a page instead of data.");
+  }
+
+  if (body.trim() === "") {
+    return null;
+  }
+
+  try {
+    // Some endpoints double-encode: a JSON string containing JSON.
+    const parsed = JSON.parse(body);
+    return typeof parsed === "string" ? JSON.parse(parsed) : parsed;
+  } catch {
+    throw new Error("The portal returned data in an unexpected format.");
+  }
+}
+
+/**
+ * Branch, section, semester and roll number.
+ *
+ * Source of truth for who the student is; replaces guessing from page markup.
+ * Failure is non-fatal — attendance still works without it.
+ */
+async function fetchAcademicInfo(): Promise<StudentContext> {
+  try {
+    const payload = (await fetchPortalJson("stu_getAcademicInformationNew.json")) as
+      | { AcademicInfo?: Record<string, string> }
+      | null;
+
+    const info = payload?.AcademicInfo;
+    if (!info) {
+      return {};
+    }
+
+    const clean = (value?: string) => {
+      const trimmed = value?.trim();
+      return trimmed && trimmed !== "null" ? trimmed : undefined;
+    };
+
+    return {
+      branch: clean(info.courseName),
+      section: clean(info.divisionName),
+      semesterLabel: clean(info.semesterName),
+      rollNo: clean(info.rollNo),
+    };
+  } catch (error) {
+    if (error instanceof SessionExpiredError) {
+      throw error;
+    }
+    return {};
+  }
+}
+
+async function resolveStudentContext(): Promise<StudentContext> {
+  const fromPortal = await fetchAcademicInfo().catch((error) => {
+    if (error instanceof SessionExpiredError) {
+      throw error;
+    }
+    return {} as StudentContext;
+  });
+
+  return {
+    ...fromPortal,
+    studentName: fromPortal.studentName ?? detectStudentNameFromDom(),
+    semesterLabel: fromPortal.semesterLabel ?? detectSemesterFromDom(),
+  };
 }
 
 async function fetchPortalTimetable(force = false) {
@@ -768,7 +907,12 @@ async function fetchPortalTimetable(force = false) {
       `/stu_getTodaysScheduleForStudentLoggedIn.json?date=${encodeURIComponent(
         formatPortalDate(start),
       )}`,
-    ).catch(() => []),
+    ).catch((error) => {
+      if (error instanceof SessionExpiredError) {
+        throw error;
+      }
+      return [];
+    }),
     fetchPortalJson(
       `/getBetweenDatesTimetableForStudent.json?startDate=${encodeURIComponent(
         formatPortalDate(start),
@@ -779,10 +923,12 @@ async function fetchPortalTimetable(force = false) {
   const rows = Array.isArray(betweenPayload) ? (betweenPayload as PortalTimetableRow[]) : [];
   const calendarSessions = buildCalendarSessions(rows);
   const timetable = buildWeeklyTimetable(calendarSessions);
+
   const holidayMessage =
-    Array.isArray(todayPayload) && todayPayload[0]?.holiday
-      ? `Today is marked as ${todayPayload[0].holiday}.`
+    Array.isArray(todayPayload) && (todayPayload[0] as { holiday?: string })?.holiday
+      ? `Today is marked as ${(todayPayload[0] as { holiday?: string }).holiday}.`
       : undefined;
+
   const signature = JSON.stringify(
     calendarSessions.map((session) => [
       session.subjectId,
@@ -810,40 +956,75 @@ async function fetchPortalTimetable(force = false) {
       message:
         calendarSessions.length > 0
           ? holidayMessage
-            ? `Imported ${calendarSessions.length} upcoming classes. ${holidayMessage}`
-            : `Imported ${calendarSessions.length} upcoming classes from the portal.`
-          : holidayMessage ?? "The portal returned no upcoming classes in the selected range.",
+            ? `Synced ${calendarSessions.length} upcoming classes. ${holidayMessage}`
+            : `Synced ${calendarSessions.length} upcoming classes.`
+          : (holidayMessage ?? "The portal returned no upcoming classes in this range."),
     },
   });
 
   return { imported: true, count: calendarSessions.length };
 }
 
-async function syncPortalData(force = false) {
-  const timetableResult = await fetchPortalTimetable(force).catch((error) => {
-    console.warn("[NIET Planner] Timetable sync failed:", error);
-    chrome.runtime.sendMessage({
+async function reportSyncProblem(error: unknown) {
+  const expired = error instanceof SessionExpiredError;
+
+  await chrome.runtime
+    .sendMessage({
       type: "PORTAL_TIMETABLE_ERROR",
-      payload: error instanceof Error ? error.message : String(error),
-    }).catch(() => {});
-    return { imported: false, count: 0, error: String(error) };
-  });
+      payload: {
+        message:
+          expired || !(error instanceof Error)
+            ? "Your NIET ERP session expired. Sign in again to refresh."
+            : error.message,
+        status: expired ? "session-expired" : "error",
+      },
+    })
+    .catch(() => {});
+}
+
+async function syncPortalData(force = false) {
+  let student: StudentContext = {};
+  let timetableImported = false;
+
+  try {
+    student = await resolveStudentContext();
+
+    if (Object.values(student).some(Boolean)) {
+      await chrome.runtime
+        .sendMessage({ type: "STUDENT_PROFILE_DETECTED", payload: student })
+        .catch(() => {});
+    }
+
+    const timetableResult = await fetchPortalTimetable(force);
+    timetableImported = timetableResult.imported;
+  } catch (error) {
+    await reportSyncProblem(error);
+  }
 
   if (!detectAttendanceTable()) {
     clearOverlay();
     lastSignature = "";
-    return { found: false, imported: false, timetableImported: timetableResult.imported };
+    return { found: false, imported: false, timetableImported };
   }
 
   const signature = subjectSignature();
   if (!force && signature === lastSignature) {
-    return { found: true, imported: false, timetableImported: timetableResult.imported };
+    return { found: true, imported: false, timetableImported };
   }
 
   lastSignature = signature;
-  injectOverlayBadges();
-  await sendAttendanceToServiceWorker();
-  return { found: true, imported: true, timetableImported: timetableResult.imported };
+
+  // Suspend observation while we write to the page, otherwise our own badge
+  // insertions retrigger the observer and it rescans forever.
+  injecting = true;
+  try {
+    injectOverlayBadges();
+  } finally {
+    injecting = false;
+  }
+
+  await sendAttendanceToServiceWorker(student);
+  return { found: true, imported: true, timetableImported };
 }
 
 function scheduleSync(force = false) {
@@ -858,8 +1039,32 @@ function scheduleSync(force = false) {
   }, RESCAN_DEBOUNCE_MS);
 }
 
+/** True when every mutation came from our own overlay. */
+function isSelfInflicted(mutations: MutationRecord[]) {
+  return mutations.every((mutation) => {
+    const target = mutation.target as HTMLElement;
+    if (target?.closest?.(`[${OVERLAY_ATTR}]`)) {
+      return true;
+    }
+
+    const touched = [...mutation.addedNodes, ...mutation.removedNodes];
+    return (
+      touched.length > 0 &&
+      touched.every(
+        (node) =>
+          node instanceof HTMLElement &&
+          (node.hasAttribute(OVERLAY_ATTR) || node.closest(`[${OVERLAY_ATTR}]`) !== null),
+      )
+    );
+  });
+}
+
 function monitorPageChanges() {
-  const observer = new MutationObserver(() => {
+  observer = new MutationObserver((mutations) => {
+    if (injecting || isSelfInflicted(mutations)) {
+      return;
+    }
+
     if (location.href !== currentUrl) {
       currentUrl = location.href;
       scheduleSync(true);
@@ -869,10 +1074,11 @@ function monitorPageChanges() {
     scheduleSync(false);
   });
 
+  // characterData is deliberately omitted: the ERP rewrites text nodes
+  // constantly and watching them kept the whole page in a rescan loop.
   observer.observe(document.documentElement, {
     childList: true,
     subtree: true,
-    characterData: true,
   });
 
   window.addEventListener("popstate", () => scheduleSync(true));
@@ -880,6 +1086,22 @@ function monitorPageChanges() {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === "SET_OVERLAY_ENABLED") {
+    overlayEnabled = Boolean(message.payload);
+    if (!overlayEnabled) {
+      clearOverlay();
+    } else {
+      injecting = true;
+      try {
+        injectOverlayBadges();
+      } finally {
+        injecting = false;
+      }
+    }
+    sendResponse({ success: true });
+    return false;
+  }
+
   if (message?.type !== "SCRAPE_ATTENDANCE") {
     return false;
   }
@@ -895,7 +1117,16 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   return true;
 });
 
-function init() {
+async function init() {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: "GET_PREFERENCES" });
+    if (response?.success) {
+      overlayEnabled = response.preferences?.showPageOverlay ?? true;
+    }
+  } catch {
+    // Preferences are best-effort; default to showing the overlay.
+  }
+
   syncPortalData(true).catch((error) => {
     console.warn("[NIET Planner] Initial sync failed:", error);
   });
@@ -903,7 +1134,7 @@ function init() {
 }
 
 if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", init, { once: true });
+  document.addEventListener("DOMContentLoaded", () => void init(), { once: true });
 } else {
-  init();
+  void init();
 }

@@ -390,7 +390,11 @@ export function parsedToSubjects(
     const existing = existingByCode.get(subject.code.toLowerCase());
     const type: SubjectType =
       existing?.type ??
-      (/lab/i.test(subject.name) ? "lab" : /mooc/i.test(subject.name) ? "other" : "theory");
+      (/\blab\b|practical|workshop/i.test(subject.name)
+        ? "lab"
+        : /mooc|nptel/i.test(subject.name)
+          ? "other"
+          : "theory");
 
     return {
       id: existing?.id ?? subject.code.toLowerCase(),

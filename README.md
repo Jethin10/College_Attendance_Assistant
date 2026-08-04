@@ -1,47 +1,121 @@
 # NIET Attendance Planner
 
-A Chrome extension for NIET ERP that reads attendance data from `nietcloud.niet.co.in`, estimates how many classes you can safely miss, and simulates the impact of future absences.
+A Chrome extension for NIET students. It reads your attendance from the NIET
+ERP and tells you, in one line, whether you can afford to miss a class.
+
+Everything stays on your device. No server, no account, no analytics.
+
+---
+
+## Why the number in this extension differs from the ERP's
+
+The ERP shows your **overall** attendance. NIET's policy is stricter than that:
+
+> Every student must maintain a minimum of **75% attendance in each theory and
+> practical subject individually**. So that overall attendance will be
+> maintained above 75%.
+>
+> — *NIET Attendance Policy, Academic Year 2025–26, §1*
+
+Those are not the same requirement. You can sit at 82% overall while one
+subject is at 71% — and that single subject is enough to have you detained
+from sessional and end-semester exams (§13).
+
+So this extension leads with your **weakest** subject, not your average. When it
+says "safe to miss 3 classes", that is the number your worst subject can
+absorb, and it names which subject is holding you back.
+
+---
 
 ## What it does
 
-- Scrapes the attendance table directly from the NIET ERP portal
-- Injects status badges and a summary bar on the ERP page
-- Pulls upcoming timetable data from portal JSON endpoints
-- Stores attendance, timetable, and simulation history in `chrome.storage.local`
-- Shows a popup dashboard with overall risk, bunkable classes, leave days, and what-if simulations
-- Includes a generated `dist/` build so the repo can be loaded as an unpacked extension right away
+- **Reads your attendance automatically** when you open the ERP — no typing
+- **Detects your branch, section and semester** from the portal itself, so it
+  works for every branch and stream with no configuration
+- **Syncs your real timetable** for the next 45 days, with actual dates, so
+  leave planning accounts for the days you actually have class
+- **Plans leave** — pick days off, a date range, or a number of classes, and see
+  the effect on every subject before you commit
+- **Shows a summary on the ERP page** above your attendance table (dismissible)
+- **Badges the toolbar icon** with your lowest subject percentage
 
-## Project structure
+## What it does not do
 
-- `src/content/`: content script that watches the ERP page, scrapes attendance, and syncs timetable data
-- `src/background/`: service worker that handles messaging, storage updates, and badge state
-- `src/lib/`: attendance engine, ERP parsing helpers, storage wrapper, and shared types
-- `src/popup/`: popup UI, styles, and simulation controls
-- `scripts/`: build helpers for bundling the content script and copying static assets
-- `dist/`: production build output for loading in Chrome
+- It does not know about approved OD, medical condonation, or curricular
+  exemptions. Those are applied by your department, not visible to the
+  extension, and are not counted here.
+- It is not an official NIET product, and its numbers are estimates for
+  planning. The ERP is the authoritative record.
 
-## Load the extension
+---
 
-1. Open `chrome://extensions`
-2. Turn on Developer mode
-3. Click Load unpacked
-4. Select the `dist` folder from this repository
+## Install
 
-## Develop locally
+### From the Chrome Web Store
+
+Search for "NIET Attendance Planner", or use the store link once published.
+
+### From source
 
 ```bash
+cd extension
 npm install
 npm run build
 ```
 
-For watch mode:
+Then open `chrome://extensions`, enable **Developer mode**, click **Load
+unpacked**, and select `extension/dist`.
+
+Open the NIET ERP, sign in, and visit your attendance page. The extension fills
+in on its own.
+
+---
+
+## Development
 
 ```bash
-npm run dev
+npm run dev        # watch mode
+npm run build      # typecheck, bundle, generate icons, copy assets
+npm test           # engine and parser tests
+npm run typecheck  # tsc --noEmit
+npm run icons      # regenerate PNG icons from the SVG source
+npm run package    # verify dist/ and produce a Web Store zip
 ```
 
-## Notes
+### Layout
 
-- The extension is scoped to `*://nietcloud.niet.co.in/*`
-- All student data stays in the browser via `chrome.storage.local`
-- The current attendance threshold is configured as `75%`
+```
+extension/
+  src/
+    background/    service worker — message routing, toolbar badge
+    content/       runs on the ERP: scraping, portal fetches, page overlay
+    lib/           attendance engine, ERP parser, storage, shared types
+    popup/         popup UI
+  scripts/         build helpers (content bundle, icons, static copy, packaging)
+  tests/           engine and parser tests
+```
+
+`src/lib/attendance-engine.ts` holds all the maths and is the file to read
+first. It is deliberately free of Chrome APIs so it can be tested directly.
+
+### Testing
+
+Tests are bundled with esbuild (so the `@/` alias resolves) and run under
+node's built-in test runner. No test framework dependency.
+
+The most important test is `a healthy average does not hide a failing subject`
+— it is the regression guard for the per-subject rule described above.
+
+---
+
+## Privacy
+
+See [PRIVACY.md](PRIVACY.md). In short: the extension reads only
+`nietcloud.niet.co.in`, stores only in `chrome.storage.local`, never sees your
+password, and sends nothing anywhere.
+
+---
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).

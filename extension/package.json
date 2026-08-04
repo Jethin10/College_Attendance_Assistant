@@ -1,11 +1,15 @@
 {
   "name": "niet-attendance-extension",
-  "version": "2.0.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node scripts/copy-static.mjs && node scripts/build-content.mjs && vite build --watch",
-    "build": "vite build && node scripts/build-content.mjs && node scripts/copy-static.mjs",
+    "dev": "node scripts/build-icons.mjs && node scripts/copy-static.mjs && node scripts/build-content.mjs && vite build --watch",
+    "build": "npm run typecheck && vite build && node scripts/build-content.mjs && node scripts/build-icons.mjs && node scripts/copy-static.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/run-tests.mjs",
+    "icons": "node scripts/build-icons.mjs",
+    "package": "node scripts/package.mjs",
     "clean": "rimraf dist"
   },
   "devDependencies": {

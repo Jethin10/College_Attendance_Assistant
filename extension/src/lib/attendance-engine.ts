@@ -1,9 +1,26 @@
+/**
+ * Attendance engine.
+ *
+ * IMPORTANT — the threshold is per subject, not aggregate.
+ *
+ * NIET Attendance Policy 2025-26, section 1:
+ *   "Every student must maintain a minimum of 75% attendance in each theory
+ *    and practical subject individually. So that overall attendance will be
+ *    maintained above 75%."
+ *
+ * A student can therefore sit above 75% overall while a single subject is
+ * below it and they are already detainable. Every "is it safe to miss a
+ * class" answer in this file is consequently driven by the WORST subject,
+ * and aggregate percentages are reported only so the student can cross-check
+ * against what the ERP displays.
+ */
+
 import {
-  AttendanceAdjustment,
   AttendancePolicy,
   CalendarSession,
   DashboardData,
   DashboardSubject,
+  RiskStatus,
   ScheduleSlot,
   SimulationRequest,
   SimulationResult,
@@ -11,6 +28,9 @@ import {
   SubjectProjection,
   TimetableSyncState,
 } from "@/lib/types";
+
+/** Guard for schedule projections so a bad slot set cannot spin forever. */
+const PROJECTION_DAY_LIMIT = 180;
 
 function round(value: number, digits = 2) {
   return Number(value.toFixed(digits));
@@ -23,9 +43,22 @@ function toDateKey(date: Date) {
   return `${year}-${month}-${day}`;
 }
 
+/**
+ * Parses `YYYY-MM-DD` in LOCAL time.
+ *
+ * `new Date("2026-08-04")` parses as UTC midnight, which is the previous day
+ * in any negative-offset zone and shifts the date once local hours are set on
+ * top of it. Always route date-key parsing through here.
+ */
 function parseDateKey(dateKey: string) {
   const [year, month, day] = dateKey.split("-").map(Number);
   return new Date(year, (month ?? 1) - 1, day ?? 1);
+}
+
+function startOfDay(date: Date) {
+  const copy = new Date(date);
+  copy.setHours(0, 0, 0, 0);
+  return copy;
 }
 
 function parseTimeMinutes(time: string) {
@@ -43,7 +76,7 @@ function sessionStartDate(session: CalendarSession) {
   return date;
 }
 
-function latestCalendarSessionDate(calendarSessions: CalendarSession[]) {
+function latestCalendarSession(calendarSessions: CalendarSession[]) {
   if (calendarSessions.length === 0) {
     return null;
   }
@@ -82,6 +115,10 @@ export function computeNextMissDrop(attended: number, held: number) {
   return round(current - afterMiss);
 }
 
+/**
+ * How many further classes of this subject can be missed while staying at or
+ * above the threshold. Missing a class raises `held` but not `attended`.
+ */
 export function computeBunkableClasses(
   attended: number,
   held: number,
@@ -92,6 +129,11 @@ export function computeBunkableClasses(
   }
 
   const thresholdRatio = thresholdPercent / 100;
+  if (thresholdRatio <= 0) {
+    return 0;
+  }
+
+  // Largest n where attended / (held + n) >= ratio.
   const limit = Math.floor(attended / thresholdRatio - held);
   return Math.max(0, limit);
 }
@@ -103,22 +145,25 @@ export function computeRecoveryClassesNeeded(
 ) {
   const thresholdRatio = thresholdPercent / 100;
 
-  if (held <= 0 || attended / held >= thresholdRatio) {
+  // At a 100% requirement no finite number of future classes recovers a past
+  // absence, so report 0 rather than looping forever.
+  if (held <= 0 || thresholdRatio >= 1) {
     return 0;
   }
 
-  let recovery = 0;
-  while ((attended + recovery) / (held + recovery) < thresholdRatio) {
-    recovery += 1;
+  if (attended / held >= thresholdRatio) {
+    return 0;
   }
 
-  return recovery;
+  // attended + n >= ratio * (held + n)  ->  n >= (ratio*held - attended)/(1-ratio)
+  const needed = (thresholdRatio * held - attended) / (1 - thresholdRatio);
+  return Math.max(0, Math.ceil(round(needed, 6)));
 }
 
 export function getSubjectStatus(
   percent: number,
   thresholdPercent: number,
-): "safe" | "warning" | "critical" {
+): RiskStatus {
   if (percent < thresholdPercent) {
     return "critical";
   }
@@ -130,93 +175,111 @@ export function getSubjectStatus(
   return "safe";
 }
 
-function sumApprovedCreditsForSubject(
-  adjustments: AttendanceAdjustment[],
-  subjectId: string,
-) {
-  return adjustments
-    .filter(
-      (adjustment) =>
-        adjustment.approvalStatus === "approved" &&
-        adjustment.subjectIds.includes(subjectId),
-    )
-    .reduce((sum, adjustment) => sum + adjustment.creditedClasses, 0);
+function worstStatus(statuses: RiskStatus[]): RiskStatus {
+  if (statuses.includes("critical")) {
+    return "critical";
+  }
+  if (statuses.includes("warning")) {
+    return "warning";
+  }
+  return "safe";
 }
 
-function effectiveSubject(
-  subject: Subject,
-  adjustments: AttendanceAdjustment[],
+/** Sessions on or after `from`, grouped by date key then subject id. */
+function sessionsByDateAndSubject(
+  calendarSessions: CalendarSession[],
+  from?: Date,
 ) {
-  const credited = sumApprovedCreditsForSubject(adjustments, subject.id);
+  const floor = from ? startOfDay(from) : null;
+  const byDate = new Map<string, Map<string, number>>();
 
-  return {
-    ...subject,
-    effectiveAttended: subject.attendedClasses + credited,
-  };
+  for (const session of calendarSessions) {
+    if (floor && sessionStartDate(session) < floor) {
+      continue;
+    }
+
+    const bySubject = byDate.get(session.date) ?? new Map<string, number>();
+    bySubject.set(session.subjectId, (bySubject.get(session.subjectId) ?? 0) + 1);
+    byDate.set(session.date, bySubject);
+  }
+
+  return byDate;
 }
 
-function computeSafeLeaveDaysFromSessions(args: {
-  bunkableClasses: number;
+/**
+ * Full days that can be taken off while EVERY subject stays at or above the
+ * threshold.
+ *
+ * A pooled budget is wrong here: if the weakest subject meets twice on one
+ * day, spending two classes from a shared pool hides the fact that the
+ * weakest subject absorbed both. Each subject carries its own budget and the
+ * first day that pushes any budget negative ends the run.
+ */
+function safeLeaveDaysFromSessions(args: {
+  budgets: Map<string, number>;
   calendarSessions: CalendarSession[];
   startDate?: Date;
 }) {
-  if (args.bunkableClasses <= 0 || args.calendarSessions.length === 0) {
-    return 0;
-  }
-
-  const countsByDate = args.calendarSessions.reduce<Map<string, number>>((acc, session) => {
-    const sessionDate = sessionStartDate(session);
-    if (args.startDate && sessionDate < args.startDate) {
-      return acc;
-    }
-    acc.set(session.date, (acc.get(session.date) ?? 0) + 1);
-    return acc;
-  }, new Map());
-
-  let remainingBunks = args.bunkableClasses;
+  const byDate = sessionsByDateAndSubject(args.calendarSessions, args.startDate);
+  const remaining = new Map(args.budgets);
   let leaveDays = 0;
 
-  for (const [, classes] of [...countsByDate.entries()].sort((a, b) =>
-    a[0].localeCompare(b[0]),
-  )) {
-    if (remainingBunks < classes) {
+  for (const dateKey of [...byDate.keys()].sort((a, b) => a.localeCompare(b))) {
+    const bySubject = byDate.get(dateKey)!;
+
+    const affordable = [...bySubject.entries()].every(
+      ([subjectId, classes]) => (remaining.get(subjectId) ?? 0) >= classes,
+    );
+
+    if (!affordable) {
       break;
     }
-    remainingBunks -= classes;
+
+    for (const [subjectId, classes] of bySubject.entries()) {
+      remaining.set(subjectId, (remaining.get(subjectId) ?? 0) - classes);
+    }
     leaveDays += 1;
   }
 
-  return leaveDays;
+  return { leaveDays, remaining };
 }
 
-function computeSafeLeaveDaysFromSlots(args: {
-  bunkableClasses: number;
+/** Same rule as above, projected forward from a repeating weekly timetable. */
+function safeLeaveDaysFromSlots(args: {
+  budgets: Map<string, number>;
   timetable: ScheduleSlot[];
   startDate?: Date;
 }) {
-  if (args.bunkableClasses <= 0 || args.timetable.length === 0) {
+  if (args.timetable.length === 0) {
     return 0;
   }
 
-  const classesByDay = args.timetable.reduce<Record<number, number>>((acc, slot) => {
-    acc[slot.dayOfWeek] = (acc[slot.dayOfWeek] ?? 0) + 1;
-    return acc;
-  }, {});
+  const slotsByDay = new Map<number, Map<string, number>>();
+  for (const slot of args.timetable) {
+    const bySubject = slotsByDay.get(slot.dayOfWeek) ?? new Map<string, number>();
+    bySubject.set(slot.subjectId, (bySubject.get(slot.subjectId) ?? 0) + 1);
+    slotsByDay.set(slot.dayOfWeek, bySubject);
+  }
 
-  let remainingBunks = args.bunkableClasses;
+  const remaining = new Map(args.budgets);
   let leaveDays = 0;
-  const cursor = new Date(args.startDate ?? new Date());
-  cursor.setHours(0, 0, 0, 0);
+  const cursor = startOfDay(args.startDate ?? new Date());
 
-  for (let i = 0; i < 180; i += 1) {
-    const daySlots = classesByDay[cursor.getDay()] ?? 0;
+  for (let i = 0; i < PROJECTION_DAY_LIMIT; i += 1) {
+    const bySubject = slotsByDay.get(cursor.getDay());
 
-    if (daySlots > 0) {
-      if (remainingBunks < daySlots) {
+    if (bySubject && bySubject.size > 0) {
+      const affordable = [...bySubject.entries()].every(
+        ([subjectId, classes]) => (remaining.get(subjectId) ?? 0) >= classes,
+      );
+
+      if (!affordable) {
         break;
       }
 
-      remainingBunks -= daySlots;
+      for (const [subjectId, classes] of bySubject.entries()) {
+        remaining.set(subjectId, (remaining.get(subjectId) ?? 0) - classes);
+      }
       leaveDays += 1;
     }
 
@@ -226,183 +289,139 @@ function computeSafeLeaveDaysFromSlots(args: {
   return leaveDays;
 }
 
+/**
+ * Safe full days off, preferring the portal's dated schedule and continuing
+ * with the repeating weekly timetable once those dates run out.
+ */
 function computeSafeLeaveDays(args: {
-  bunkableClasses: number;
+  budgets: Map<string, number>;
   timetable: ScheduleSlot[];
   calendarSessions: CalendarSession[];
   startDate?: Date;
 }) {
-  if (args.calendarSessions.length > 0) {
-    const exactDays = computeSafeLeaveDaysFromSessions(args);
-    const countsByDate = args.calendarSessions.reduce<Map<string, number>>((acc, session) => {
-      const sessionDate = sessionStartDate(session);
-      if (args.startDate && sessionDate < args.startDate) {
-        return acc;
-      }
-      acc.set(session.date, (acc.get(session.date) ?? 0) + 1);
-      return acc;
-    }, new Map());
-    const consumedClasses = [...countsByDate.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .slice(0, exactDays)
-      .reduce((sum, [, classes]) => sum + classes, 0);
-    const remainingBunks = Math.max(0, args.bunkableClasses - consumedClasses);
-    const lastSession = latestCalendarSessionDate(args.calendarSessions);
-
-    if (remainingBunks <= 0 || !lastSession) {
-      return exactDays;
-    }
-
-    const continuationStart = sessionStartDate(lastSession);
-    continuationStart.setDate(continuationStart.getDate() + 1);
-    continuationStart.setHours(0, 0, 0, 0);
-
-    return (
-      exactDays +
-      computeSafeLeaveDaysFromSlots({
-        bunkableClasses: remainingBunks,
-        timetable: args.timetable,
-        startDate: continuationStart,
-      })
-    );
-  }
-
-  return computeSafeLeaveDaysFromSlots(args);
-}
-
-function computeRecoveryDaysFromSessions(args: {
-  recoveryClassesNeeded: number;
-  calendarSessions: CalendarSession[];
-  startDate?: Date;
-}) {
-  if (args.recoveryClassesNeeded <= 0 || args.calendarSessions.length === 0) {
+  const anyBudget = [...args.budgets.values()].some((value) => value > 0);
+  if (!anyBudget) {
     return 0;
   }
 
-  const countsByDate = args.calendarSessions.reduce<Map<string, number>>((acc, session) => {
-    const sessionDate = sessionStartDate(session);
-    if (args.startDate && sessionDate < args.startDate) {
-      return acc;
-    }
-    acc.set(session.date, (acc.get(session.date) ?? 0) + 1);
-    return acc;
-  }, new Map());
+  if (args.calendarSessions.length === 0) {
+    return safeLeaveDaysFromSlots({
+      budgets: args.budgets,
+      timetable: args.timetable,
+      startDate: args.startDate,
+    });
+  }
 
-  let remaining = args.recoveryClassesNeeded;
+  const { leaveDays, remaining } = safeLeaveDaysFromSessions({
+    budgets: args.budgets,
+    calendarSessions: args.calendarSessions,
+    startDate: args.startDate,
+  });
+
+  const lastSession = latestCalendarSession(args.calendarSessions);
+  const budgetLeft = [...remaining.values()].some((value) => value > 0);
+
+  if (!budgetLeft || !lastSession || args.timetable.length === 0) {
+    return leaveDays;
+  }
+
+  const continuationStart = startOfDay(sessionStartDate(lastSession));
+  continuationStart.setDate(continuationStart.getDate() + 1);
+
+  return (
+    leaveDays +
+    safeLeaveDaysFromSlots({
+      budgets: remaining,
+      timetable: args.timetable,
+      startDate: continuationStart,
+    })
+  );
+}
+
+/**
+ * Days of attendance needed to clear every subject's recovery requirement.
+ *
+ * `beyondSchedule` is true when the known schedule ends before the target is
+ * reached, so the UI can say the estimate runs past synced data instead of
+ * implying certainty.
+ */
+function computeRecoveryDays(args: {
+  needBySubject: Map<string, number>;
+  timetable: ScheduleSlot[];
+  calendarSessions: CalendarSession[];
+  startDate?: Date;
+}): { days: number; beyondSchedule: boolean } {
+  const outstanding = new Map(
+    [...args.needBySubject.entries()].filter(([, need]) => need > 0),
+  );
+
+  if (outstanding.size === 0) {
+    return { days: 0, beyondSchedule: false };
+  }
+
   let days = 0;
 
-  for (const [, classes] of [...countsByDate.entries()].sort((a, b) =>
-    a[0].localeCompare(b[0]),
-  )) {
-    remaining -= classes;
-    days += 1;
-    if (remaining <= 0) {
-      break;
-    }
-  }
-
-  return remaining > 0 ? days : days;
-}
-
-function computeRecoveryDaysFromSlots(args: {
-  recoveryClassesNeeded: number;
-  timetable: ScheduleSlot[];
-  startDate?: Date;
-}) {
-  if (args.recoveryClassesNeeded <= 0 || args.timetable.length === 0) {
-    return 0;
-  }
-
-  const classesByDay = args.timetable.reduce<Record<number, number>>((acc, slot) => {
-    acc[slot.dayOfWeek] = (acc[slot.dayOfWeek] ?? 0) + 1;
-    return acc;
-  }, {});
-
-  let remainingRecoveryClasses = args.recoveryClassesNeeded;
-  let attendanceDays = 0;
-  const cursor = new Date(args.startDate ?? new Date());
-  cursor.setHours(0, 0, 0, 0);
-
-  for (let i = 0; i < 180; i += 1) {
-    const daySlots = classesByDay[cursor.getDay()] ?? 0;
-
-    if (daySlots > 0) {
-      remainingRecoveryClasses -= daySlots;
-      attendanceDays += 1;
-
-      if (remainingRecoveryClasses <= 0) {
-        break;
+  const spend = (bySubject: Map<string, number>) => {
+    for (const [subjectId, classes] of bySubject.entries()) {
+      const need = outstanding.get(subjectId);
+      if (need === undefined) {
+        continue;
+      }
+      const left = need - classes;
+      if (left <= 0) {
+        outstanding.delete(subjectId);
+      } else {
+        outstanding.set(subjectId, left);
       }
     }
+  };
 
+  if (args.calendarSessions.length > 0) {
+    const byDate = sessionsByDateAndSubject(args.calendarSessions, args.startDate);
+    for (const dateKey of [...byDate.keys()].sort((a, b) => a.localeCompare(b))) {
+      spend(byDate.get(dateKey)!);
+      days += 1;
+      if (outstanding.size === 0) {
+        return { days, beyondSchedule: false };
+      }
+    }
+  }
+
+  if (args.timetable.length === 0) {
+    return { days, beyondSchedule: outstanding.size > 0 };
+  }
+
+  const slotsByDay = new Map<number, Map<string, number>>();
+  for (const slot of args.timetable) {
+    const bySubject = slotsByDay.get(slot.dayOfWeek) ?? new Map<string, number>();
+    bySubject.set(slot.subjectId, (bySubject.get(slot.subjectId) ?? 0) + 1);
+    slotsByDay.set(slot.dayOfWeek, bySubject);
+  }
+
+  const lastSession = latestCalendarSession(args.calendarSessions);
+  const cursor = lastSession
+    ? startOfDay(sessionStartDate(lastSession))
+    : startOfDay(args.startDate ?? new Date());
+  if (lastSession) {
     cursor.setDate(cursor.getDate() + 1);
   }
 
-  return attendanceDays;
-}
-
-function computeRecoveryDays(args: {
-  recoveryClassesNeeded: number;
-  timetable: ScheduleSlot[];
-  calendarSessions: CalendarSession[];
-  startDate?: Date;
-}) {
-  if (args.calendarSessions.length > 0) {
-    const exactDays = computeRecoveryDaysFromSessions(args);
-    const countsByDate = args.calendarSessions.reduce<Map<string, number>>((acc, session) => {
-      const sessionDate = sessionStartDate(session);
-      if (args.startDate && sessionDate < args.startDate) {
-        return acc;
-      }
-      acc.set(session.date, (acc.get(session.date) ?? 0) + 1);
-      return acc;
-    }, new Map());
-    const recoveredClasses = [...countsByDate.entries()]
-      .sort((a, b) => a[0].localeCompare(b[0]))
-      .slice(0, exactDays)
-      .reduce((sum, [, classes]) => sum + classes, 0);
-    const remainingRecoveryClasses = Math.max(
-      0,
-      args.recoveryClassesNeeded - recoveredClasses,
-    );
-    const lastSession = latestCalendarSessionDate(args.calendarSessions);
-
-    if (remainingRecoveryClasses <= 0 || !lastSession) {
-      return exactDays;
+  for (let i = 0; i < PROJECTION_DAY_LIMIT && outstanding.size > 0; i += 1) {
+    const bySubject = slotsByDay.get(cursor.getDay());
+    if (bySubject && bySubject.size > 0) {
+      spend(bySubject);
+      days += 1;
     }
-
-    const continuationStart = sessionStartDate(lastSession);
-    continuationStart.setDate(continuationStart.getDate() + 1);
-    continuationStart.setHours(0, 0, 0, 0);
-
-    return (
-      exactDays +
-      computeRecoveryDaysFromSlots({
-        recoveryClassesNeeded: remainingRecoveryClasses,
-        timetable: args.timetable,
-        startDate: continuationStart,
-      })
-    );
+    cursor.setDate(cursor.getDate() + 1);
   }
 
-  return computeRecoveryDaysFromSlots(args);
+  return { days, beyondSchedule: outstanding.size > 0 };
 }
 
-function computeEffectiveTotals(
-  subjects: Subject[],
-  adjustments: AttendanceAdjustment[],
-) {
-  const effectiveSubjects = subjects.map((subject) =>
-    effectiveSubject(subject, adjustments),
-  );
-
+function totalsOf(subjects: Subject[]) {
   return {
-    effectiveSubjects,
-    totalAttended: effectiveSubjects.reduce(
-      (sum, subject) => sum + subject.effectiveAttended,
-      0,
-    ),
-    totalHeld: subjects.reduce((sum, subject) => sum + subject.heldClasses, 0),
+    totalAttended: subjects.reduce((sum, s) => sum + s.attendedClasses, 0),
+    totalHeld: subjects.reduce((sum, s) => sum + s.heldClasses, 0),
   };
 }
 
@@ -413,20 +432,16 @@ export function buildDashboardData(input: {
   timetable: ScheduleSlot[];
   calendarSessions: CalendarSession[];
   timetableSync: TimetableSyncState;
-  adjustments: AttendanceAdjustment[];
   recentSimulation?: SimulationResult;
   erpSnapshot?: DashboardData["erpSnapshot"];
 }): DashboardData {
-  const { effectiveSubjects, totalAttended, totalHeld } = computeEffectiveTotals(
-    input.subjects,
-    input.adjustments,
-  );
+  const threshold = input.policy.thresholdPercent;
+  const { totalAttended, totalHeld } = totalsOf(input.subjects);
 
-  const subjects: DashboardSubject[] = input.subjects.map((subject, index) => {
-    const effective = effectiveSubjects[index];
+  const subjects: DashboardSubject[] = input.subjects.map((subject) => {
     const hasStarted = subject.heldClasses > 0;
     const attendancePercent = hasStarted
-      ? computeAttendancePercent(effective.effectiveAttended, subject.heldClasses)
+      ? computeAttendancePercent(subject.attendedClasses, subject.heldClasses)
       : 0;
 
     return {
@@ -435,40 +450,51 @@ export function buildDashboardData(input: {
       name: subject.name,
       type: subject.type,
       heldClasses: subject.heldClasses,
-      attendedClasses: round(effective.effectiveAttended),
+      attendedClasses: round(subject.attendedClasses),
       attendancePercent,
       nextMissDropPercent: computeNextMissDrop(
-        effective.effectiveAttended,
+        subject.attendedClasses,
         subject.heldClasses,
       ),
       bunkableClasses: computeBunkableClasses(
-        effective.effectiveAttended,
+        subject.attendedClasses,
         subject.heldClasses,
-        input.policy.thresholdPercent,
+        threshold,
       ),
       recoveryClassesNeeded: computeRecoveryClassesNeeded(
-        effective.effectiveAttended,
+        subject.attendedClasses,
         subject.heldClasses,
-        input.policy.thresholdPercent,
+        threshold,
       ),
       severeMedicalEligible:
         hasStarted && attendancePercent >= input.policy.severeMedicalFloorPercent,
-      status: hasStarted
-        ? getSubjectStatus(attendancePercent, input.policy.thresholdPercent)
-        : "not-started",
+      status: hasStarted ? getSubjectStatus(attendancePercent, threshold) : "not-started",
     };
   });
 
-  const startedSubjects = subjects.filter((subject) => subject.status !== "not-started");
-  const averageAttendance =
-    startedSubjects.reduce((sum, subject) => sum + subject.attendancePercent, 0) /
-    Math.max(startedSubjects.length, 1);
-  const overallAttendancePercent = computeAttendancePercent(totalAttended, totalHeld);
-  const overallBunkableClasses = computeBunkableClasses(
-    totalAttended,
-    totalHeld,
-    input.policy.thresholdPercent,
+  // Subjects with no classes held yet carry no information; including them
+  // would force the minimum to 0 and report a false "not safe".
+  const started = subjects.filter((subject) => subject.status !== "not-started");
+
+  // The binding constraint: least headroom, tie-broken by lowest percentage.
+  const binding = [...started].sort(
+    (a, b) =>
+      a.bunkableClasses - b.bunkableClasses ||
+      a.attendancePercent - b.attendancePercent,
+  )[0];
+
+  const safeToMissClasses = started.length > 0 ? binding.bunkableClasses : 0;
+
+  const budgets = new Map(
+    subjects.map((subject) => [
+      subject.id,
+      subject.status === "not-started" ? Number.POSITIVE_INFINITY : subject.bunkableClasses,
+    ]),
   );
+
+  const averageAttendance =
+    started.reduce((sum, subject) => sum + subject.attendancePercent, 0) /
+    Math.max(started.length, 1);
 
   return {
     student: input.student,
@@ -476,51 +502,45 @@ export function buildDashboardData(input: {
     overall: {
       attendedClasses: round(totalAttended),
       heldClasses: round(totalHeld),
-      attendancePercent: overallAttendancePercent,
-      nextMissDropPercent: computeNextMissDrop(totalAttended, totalHeld),
-      bunkableClasses: overallBunkableClasses,
+      attendancePercent: computeAttendancePercent(totalAttended, totalHeld),
+      nextMissDropPercent: binding?.nextMissDropPercent ?? 0,
+      safeToMissClasses,
+      bindingSubjectId: binding?.id,
+      bindingSubjectName: binding?.name,
+      bindingSubjectPercent: binding?.attendancePercent,
       safeLeaveDays: computeSafeLeaveDays({
-        bunkableClasses: overallBunkableClasses,
+        budgets,
         timetable: input.timetable,
         calendarSessions: input.calendarSessions,
         startDate: new Date(),
       }),
-      recoveryClassesNeeded: computeRecoveryClassesNeeded(
-        totalAttended,
-        totalHeld,
-        input.policy.thresholdPercent,
+      recoveryClassesNeeded: started.reduce(
+        (sum, subject) => sum + subject.recoveryClassesNeeded,
+        0,
       ),
-      status: getSubjectStatus(
-        overallAttendancePercent,
-        input.policy.thresholdPercent,
-      ),
+      status: started.length > 0 ? worstStatus(started.map((s) => s.status as RiskStatus)) : "safe",
     },
     subjects,
     timetable: input.timetable,
     calendarSessions: input.calendarSessions,
     timetableSync: input.timetableSync,
-    adjustments: input.adjustments,
     recentSimulation: input.recentSimulation,
     erpSnapshot: input.erpSnapshot,
     insights: {
       averageAttendance: round(averageAttendance),
-      belowThresholdCount: subjects.filter(
-        (subject) =>
-          subject.status !== "not-started" &&
-          subject.attendancePercent < input.policy.thresholdPercent,
+      belowThresholdCount: started.filter(
+        (subject) => subject.attendancePercent < threshold,
       ).length,
       explanation:
-        "Missing one class hurts more early in the semester because the denominator is smaller. The app now uses the portal's dated schedule for leave-day predictions whenever that data is available.",
+        "NIET requires 75% in every subject individually, so the headline figure tracks your weakest subject rather than your average. Missing a class costs more early in the semester, when the total is still small.",
     },
   };
 }
 
 function dateRange(start: Date, end: Date) {
   const dates: Date[] = [];
-  const cursor = new Date(start);
-  cursor.setHours(0, 0, 0, 0);
-  const cap = new Date(end);
-  cap.setHours(0, 0, 0, 0);
+  const cursor = startOfDay(start);
+  const cap = startOfDay(end);
 
   while (cursor <= cap) {
     dates.push(new Date(cursor));
@@ -551,11 +571,11 @@ function upcomingSlotOccurrences(
 
   const orderedSlots = sortSlotsByTime(timetable);
   const occurrences: CalendarSession[] = [];
-  const cursor = new Date(startDate ?? new Date());
-  const currentMinutes = cursor.getHours() * 60 + cursor.getMinutes();
-  cursor.setHours(0, 0, 0, 0);
+  const reference = startDate ?? new Date();
+  const currentMinutes = reference.getHours() * 60 + reference.getMinutes();
+  const cursor = startOfDay(reference);
 
-  for (let i = 0; i < 180 && occurrences.length < count; i += 1) {
+  for (let i = 0; i < PROJECTION_DAY_LIMIT && occurrences.length < count; i += 1) {
     const isToday = i === 0;
     const daySlots = orderedSlots.filter((slot) => slot.dayOfWeek === cursor.getDay());
 
@@ -564,11 +584,9 @@ function upcomingSlotOccurrences(
         break;
       }
 
-      if (isToday) {
-        const slotMinutes = parseTimeMinutes(slot.startTime);
-        if (slotMinutes < currentMinutes) {
-          continue;
-        }
+      // Classes already finished today cannot be skipped.
+      if (isToday && parseTimeMinutes(slot.startTime) < currentMinutes) {
+        continue;
       }
 
       occurrences.push(makeSessionFromSlot(slot, cursor));
@@ -603,16 +621,13 @@ function weeklyOccurrencesBetweenDates(
   endDate: Date,
   subjectId?: string,
 ) {
-  const days = dateRange(startDate, endDate);
-  return days.flatMap((day) =>
+  return dateRange(startDate, endDate).flatMap((day) =>
     timetable
-      .filter((slot) => {
-        const normalized = day.getDay();
-        return (
-          slot.dayOfWeek === normalized &&
-          (!subjectId || slot.subjectId === subjectId)
-        );
-      })
+      .filter(
+        (slot) =>
+          slot.dayOfWeek === day.getDay() &&
+          (!subjectId || slot.subjectId === subjectId),
+      )
       .map((slot) => makeSessionFromSlot(slot, day)),
   );
 }
@@ -627,12 +642,10 @@ function upcomingDatesWithClassesFromSlots(
   }
 
   const dates: Date[] = [];
-  const cursor = new Date(startDate ?? new Date());
-  cursor.setHours(0, 0, 0, 0);
+  const cursor = startOfDay(startDate ?? new Date());
 
-  for (let i = 0; i < 180 && dates.length < leaveDays; i += 1) {
-    const hasClasses = timetable.some((slot) => slot.dayOfWeek === cursor.getDay());
-    if (hasClasses) {
+  for (let i = 0; i < PROJECTION_DAY_LIMIT && dates.length < leaveDays; i += 1) {
+    if (timetable.some((slot) => slot.dayOfWeek === cursor.getDay())) {
       dates.push(new Date(cursor));
     }
     cursor.setDate(cursor.getDate() + 1);
@@ -650,14 +663,15 @@ function upcomingDatesWithClassesFromSessions(
     return [];
   }
 
-  const floor = new Date(startDate ?? new Date());
-  floor.setHours(0, 0, 0, 0);
+  const floor = startOfDay(startDate ?? new Date());
 
-  return [...new Set(
-    calendarSessions
-      .filter((session) => parseDateKey(session.date) >= floor)
-      .map((session) => session.date),
-  )]
+  return [
+    ...new Set(
+      calendarSessions
+        .filter((session) => parseDateKey(session.date) >= floor)
+        .map((session) => session.date),
+    ),
+  ]
     .sort((a, b) => a.localeCompare(b))
     .slice(0, leaveDays)
     .map((dateKey) => parseDateKey(dateKey));
@@ -690,32 +704,28 @@ function impactedSlotsFromRequest(
   }
 
   if (request.mode === "future-count") {
+    const wanted = request.futureClasses ?? 0;
+    const matchesSubject = (id: string) => !request.subjectId || id === request.subjectId;
+
     if (hasExactSchedule) {
       const exact = upcomingCalendarSessions(
-        calendarSessions.filter(
-          (session) => !request.subjectId || session.subjectId === request.subjectId,
-        ),
-        request.futureClasses ?? 0,
+        calendarSessions.filter((session) => matchesSubject(session.subjectId)),
+        wanted,
         new Date(),
       );
-      const remaining = Math.max(0, (request.futureClasses ?? 0) - exact.length);
-      if (remaining === 0) {
+      const remaining = Math.max(0, wanted - exact.length);
+      const lastSession = latestCalendarSession(calendarSessions);
+      if (remaining === 0 || !lastSession) {
         return exact;
       }
 
-      const lastSession = latestCalendarSessionDate(calendarSessions);
-      if (!lastSession) {
-        return exact;
-      }
-
-      const continuationStart = sessionStartDate(lastSession);
+      const continuationStart = startOfDay(sessionStartDate(lastSession));
       continuationStart.setDate(continuationStart.getDate() + 1);
-      continuationStart.setHours(0, 0, 0, 0);
 
       return [
         ...exact,
         ...upcomingSlotOccurrences(
-          timetable.filter((slot) => !request.subjectId || slot.subjectId === request.subjectId),
+          timetable.filter((slot) => matchesSubject(slot.subjectId)),
           remaining,
           continuationStart,
         ),
@@ -723,109 +733,92 @@ function impactedSlotsFromRequest(
     }
 
     return upcomingSlotOccurrences(
-      timetable.filter((slot) => !request.subjectId || slot.subjectId === request.subjectId),
-      request.futureClasses ?? 0,
+      timetable.filter((slot) => matchesSubject(slot.subjectId)),
+      wanted,
       new Date(),
     );
   }
 
   if (request.mode === "leave-days") {
-    const startDate = request.fromDate ? new Date(request.fromDate) : new Date();
-    startDate.setHours(0, 0, 0, 0);
+    const startDate = startOfDay(
+      request.fromDate ? parseDateKey(request.fromDate) : new Date(),
+    );
+    const wantedDays = request.leaveDays ?? 0;
+    const matchesSubject = (id: string) => !request.subjectId || id === request.subjectId;
 
     if (hasExactSchedule) {
       const days = upcomingDatesWithClassesFromSessions(
         calendarSessions,
-        request.leaveDays ?? 0,
+        wantedDays,
         startDate,
       );
-
       const dayKeys = new Set(days.map((date) => toDateKey(date)));
       const exact = calendarSessions.filter(
-        (session) =>
-          dayKeys.has(session.date) &&
-          (!request.subjectId || session.subjectId === request.subjectId),
+        (session) => dayKeys.has(session.date) && matchesSubject(session.subjectId),
       );
-      const remainingDays = Math.max(0, (request.leaveDays ?? 0) - days.length);
-      if (remainingDays === 0) {
+
+      const remainingDays = Math.max(0, wantedDays - days.length);
+      const lastSession = latestCalendarSession(calendarSessions);
+      if (remainingDays === 0 || !lastSession) {
         return exact;
       }
 
-      const lastSession = latestCalendarSessionDate(calendarSessions);
-      if (!lastSession) {
-        return exact;
-      }
-
-      const continuationStart = sessionStartDate(lastSession);
+      const continuationStart = startOfDay(sessionStartDate(lastSession));
       continuationStart.setDate(continuationStart.getDate() + 1);
-      continuationStart.setHours(0, 0, 0, 0);
       if (continuationStart < startDate) {
         continuationStart.setTime(startDate.getTime());
       }
-      const fallbackDays = upcomingDatesWithClassesFromSlots(
-        timetable,
-        remainingDays,
-        continuationStart,
-      );
 
       return [
         ...exact,
-        ...fallbackDays.flatMap((day) =>
+        ...upcomingDatesWithClassesFromSlots(
+          timetable,
+          remainingDays,
+          continuationStart,
+        ).flatMap((day) =>
           timetable
-            .filter((slot) => {
-              const normalized = day.getDay();
-              return (
-                slot.dayOfWeek === normalized &&
-                (!request.subjectId || slot.subjectId === request.subjectId)
-              );
-            })
+            .filter(
+              (slot) =>
+                slot.dayOfWeek === day.getDay() && matchesSubject(slot.subjectId),
+            )
             .map((slot) => makeSessionFromSlot(slot, day)),
         ),
       ];
     }
 
-    const days = upcomingDatesWithClassesFromSlots(
-      timetable,
-      request.leaveDays ?? 0,
-      startDate,
-    );
-
-    return days.flatMap((day) =>
-      timetable
-        .filter((slot) => {
-          const normalized = day.getDay();
-          return (
-            slot.dayOfWeek === normalized &&
-            (!request.subjectId || slot.subjectId === request.subjectId)
-          );
-        })
-        .map((slot) => makeSessionFromSlot(slot, day)),
+    return upcomingDatesWithClassesFromSlots(timetable, wantedDays, startDate).flatMap(
+      (day) =>
+        timetable
+          .filter(
+            (slot) => slot.dayOfWeek === day.getDay() && matchesSubject(slot.subjectId),
+          )
+          .map((slot) => makeSessionFromSlot(slot, day)),
     );
   }
 
+  // date-range
   if (!request.fromDate || !request.toDate) {
     return [];
   }
 
+  const fromKey = request.fromDate;
+  const toKey = request.toDate;
+
   if (hasExactSchedule) {
-    const fromDate = request.fromDate;
-    const toDate = request.toDate;
     const exact = calendarSessions.filter(
       (session) =>
-        session.date >= fromDate &&
-        session.date <= toDate &&
+        session.date >= fromKey &&
+        session.date <= toKey &&
         (!request.subjectId || session.subjectId === request.subjectId),
     );
-    const lastSession = latestCalendarSessionDate(calendarSessions);
-    if (!lastSession || toDate <= lastSession.date) {
+    const lastSession = latestCalendarSession(calendarSessions);
+    if (!lastSession || toKey <= lastSession.date) {
       return exact;
     }
 
-    const continuationStart = sessionStartDate(lastSession);
+    const continuationStart = startOfDay(sessionStartDate(lastSession));
     continuationStart.setDate(continuationStart.getDate() + 1);
-    continuationStart.setHours(0, 0, 0, 0);
-    const requestedStart = new Date(fromDate);
-    requestedStart.setHours(0, 0, 0, 0);
+    const requestedStart = startOfDay(parseDateKey(fromKey));
     if (continuationStart < requestedStart) {
       continuationStart.setTime(requestedStart.getTime());
     }
@@ -835,47 +828,39 @@ function impactedSlotsFromRequest(
       ...weeklyOccurrencesBetweenDates(
         timetable,
         continuationStart,
-        new Date(toDate),
+        parseDateKey(toKey),
         request.subjectId,
       ),
     ];
   }
 
-  const days = dateRange(new Date(request.fromDate), new Date(request.toDate));
-
-  return days.flatMap((day) =>
-    timetable
-      .filter((slot) => {
-        const normalized = day.getDay();
-        return (
-          slot.dayOfWeek === normalized &&
-          (!request.subjectId || slot.subjectId === request.subjectId)
-        );
-      })
-      .map((slot) => makeSessionFromSlot(slot, day)),
+  return weeklyOccurrencesBetweenDates(
+    timetable,
+    parseDateKey(fromKey),
+    parseDateKey(toKey),
+    request.subjectId,
   );
 }
 
 function projectionForSubject(args: {
   subject: Subject;
-  adjustments: AttendanceAdjustment[];
   policy: AttendancePolicy;
   classesMissed: number;
 }): SubjectProjection {
-  const effective = effectiveSubject(args.subject, args.adjustments);
   const beforePercent = computeAttendancePercent(
-    effective.effectiveAttended,
+    args.subject.attendedClasses,
     args.subject.heldClasses,
   );
+  // A missed class increases classes held but not classes attended.
   const afterHeld = args.subject.heldClasses + args.classesMissed;
-  const afterAttended = effective.effectiveAttended;
+  const afterAttended = args.subject.attendedClasses;
   const afterPercent = computeAttendancePercent(afterAttended, afterHeld);
 
   return {
     subjectId: args.subject.id,
     subjectName: args.subject.name,
     beforeHeld: args.subject.heldClasses,
-    beforeAttended: round(effective.effectiveAttended),
+    beforeAttended: round(args.subject.attendedClasses),
     afterHeld,
     afterAttended: round(afterAttended),
     beforePercent,
@@ -901,18 +886,16 @@ export function simulateAttendance(args: {
   subjects: Subject[];
   timetable: ScheduleSlot[];
   calendarSessions: CalendarSession[];
-  adjustments: AttendanceAdjustment[];
   request: SimulationRequest;
 }): SimulationResult {
+  const threshold = args.policy.thresholdPercent;
   const impactedSlots = impactedSlotsFromRequest(
     args.timetable,
     args.calendarSessions,
     args.request,
   );
-  const { totalAttended, totalHeld } = computeEffectiveTotals(
-    args.subjects,
-    args.adjustments,
-  );
+  const { totalAttended, totalHeld } = totalsOf(args.subjects);
+
   const classesMissedBySubject = impactedSlots.reduce<Record<string, number>>(
     (acc, slot) => {
       acc[slot.subjectId] = (acc[slot.subjectId] ?? 0) + 1;
@@ -924,29 +907,76 @@ export function simulateAttendance(args: {
     (sum, count) => sum + count,
     0,
   );
+
   const overallAfterHeld = totalHeld + totalMissedClasses;
-  const overallAfterAttended = totalAttended;
   const overallBeforePercent = computeAttendancePercent(totalAttended, totalHeld);
-  const overallAfterPercent = computeAttendancePercent(
-    overallAfterAttended,
-    overallAfterHeld,
-  );
-  const overallRecoveryClassesNeeded = computeRecoveryClassesNeeded(
-    overallAfterAttended,
-    overallAfterHeld,
-    args.policy.thresholdPercent,
-  );
+  const overallAfterPercent = computeAttendancePercent(totalAttended, overallAfterHeld);
 
   const projections = args.subjects
     .filter((subject) => classesMissedBySubject[subject.id])
     .map((subject) =>
       projectionForSubject({
         subject,
-        adjustments: args.adjustments,
         policy: args.policy,
         classesMissed: classesMissedBySubject[subject.id],
       }),
     );
+
+  // Post-absence state for every subject, whether or not it was impacted.
+  const afterSubjects = args.subjects.map((subject) => {
+    const missed = classesMissedBySubject[subject.id] ?? 0;
+    return {
+      id: subject.id,
+      name: subject.name,
+      attended: subject.attendedClasses,
+      held: subject.heldClasses + missed,
+      started: subject.heldClasses > 0,
+    };
+  });
+
+  const afterStarted = afterSubjects.filter((subject) => subject.started);
+  const afterStatuses = afterStarted.map((subject) =>
+    getSubjectStatus(computeAttendancePercent(subject.attended, subject.held), threshold),
+  );
+
+  const budgets = new Map(
+    afterSubjects.map((subject) => [
+      subject.id,
+      subject.started
+        ? computeBunkableClasses(subject.attended, subject.held, threshold)
+        : Number.POSITIVE_INFINITY,
+    ]),
+  );
+
+  const recoveryBySubject = new Map(
+    afterSubjects.map((subject) => [
+      subject.id,
+      subject.started
+        ? computeRecoveryClassesNeeded(subject.attended, subject.held, threshold)
+        : 0,
+    ]),
+  );
+
+  const overallRecoveryClassesNeeded = [...recoveryBySubject.values()].reduce(
+    (sum, need) => sum + need,
+    0,
+  );
+
+  const recovery = computeRecoveryDays({
+    needBySubject: recoveryBySubject,
+    timetable: args.timetable,
+    calendarSessions: args.calendarSessions,
+    startDate: new Date(),
+  });
+
+  // Worst subject after the absence — the one that decides whether this is safe.
+  const bindingAfter = [...afterStarted]
+    .map((subject) => ({
+      name: subject.name,
+      percent: computeAttendancePercent(subject.attended, subject.held),
+      headroom: computeBunkableClasses(subject.attended, subject.held, threshold),
+    }))
+    .sort((a, b) => a.headroom - b.headroom || a.percent - b.percent)[0];
 
   return {
     request: args.request,
@@ -955,36 +985,29 @@ export function simulateAttendance(args: {
     overall: {
       beforeAttended: round(totalAttended),
       beforeHeld: round(totalHeld),
-      afterAttended: round(overallAfterAttended),
+      afterAttended: round(totalAttended),
       afterHeld: round(overallAfterHeld),
       beforePercent: overallBeforePercent,
       afterPercent: overallAfterPercent,
       deltaPercent: round(overallBeforePercent - overallAfterPercent),
       classesMissed: totalMissedClasses,
       recoveryClassesNeeded: overallRecoveryClassesNeeded,
-      recoveryDaysNeeded: computeRecoveryDays({
-        recoveryClassesNeeded: overallRecoveryClassesNeeded,
-        timetable: args.timetable,
-        calendarSessions: args.calendarSessions,
-        startDate: new Date(),
-      }),
+      recoveryDaysNeeded: recovery.days,
+      recoveryBeyondSchedule: recovery.beyondSchedule,
       safeLeaveDaysRemaining: computeSafeLeaveDays({
-        bunkableClasses: computeBunkableClasses(
-          overallAfterAttended,
-          overallAfterHeld,
-          args.policy.thresholdPercent,
-        ),
+        budgets,
         timetable: args.timetable,
         calendarSessions: args.calendarSessions,
         startDate: new Date(),
       }),
-      status: getSubjectStatus(overallAfterPercent, args.policy.thresholdPercent),
+      status: afterStatuses.length > 0 ? worstStatus(afterStatuses) : "safe",
+      bindingSubjectName: bindingAfter?.name,
     },
     summary: {
       impactedSubjects: projections.length,
       classesMissed: totalMissedClasses,
       thresholdBreaches: projections.filter(
-        (projection) => projection.afterPercent < args.policy.thresholdPercent,
+        (projection) => projection.afterPercent < threshold,
       ).length,
     },
   };

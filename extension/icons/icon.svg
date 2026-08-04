@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Master icon. A checkmark cut into an attendance ring: the ring is the
+       75% requirement, the mark is "you are clear". Rasterised per size by
+       scripts/build-icons.mjs; the 16px variant uses a simplified geometry. -->
+  <defs>
+    <clipPath id="squircle">
+      <rect width="128" height="128" rx="28"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#squircle)">
+    <rect width="128" height="128" fill="#2f6be0"/>
+    <!-- Soft top-light so the tile does not read as a flat colour chip -->
+    <rect width="128" height="128" fill="url(#sheen)"/>
+  </g>
+
+  <defs>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity=".16"/>
+      <stop offset="60%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Track -->
+  <circle cx="64" cy="64" r="34" fill="none" stroke="#ffffff" stroke-opacity=".28" stroke-width="10"/>
+
+  <!-- 75% of the circumference (2*pi*34 = 213.6): 160.2 on, remainder off.
+       Rotated -90deg so the arc starts at 12 o'clock. -->
+  <circle cx="64" cy="64" r="34" fill="none" stroke="#ffffff" stroke-width="10"
+          stroke-linecap="round" stroke-dasharray="160.2 53.4"
+          transform="rotate(-90 64 64)"/>
+
+  <!-- Check -->
+  <path d="M50 65.5 L60 75.5 L79 55" fill="none" stroke="#2f6be0" stroke-width="9"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M50 65.5 L60 75.5 L79 55" fill="none" stroke="#ffffff" stroke-width="6.5"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

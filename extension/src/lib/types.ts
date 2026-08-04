@@ -1,25 +1,12 @@
 export type SubjectType = "theory" | "lab" | "other";
 
-export type AttendanceAdjustmentCategory =
-  | "normal"
-  | "seminar"
-  | "remedial"
-  | "sessional"
-  | "technical-event"
-  | "severe-medical"
-  | "curricular"
-  | "placement"
-  | "manual";
-
-export type AttendanceAdjustmentSource = "manual" | "erp" | "od";
-
-export type ApprovalStatus = "pending" | "approved" | "rejected";
-
 export type SimulationMode =
   | "class-specific"
   | "date-range"
   | "future-count"
   | "leave-days";
+
+export type RiskStatus = "safe" | "warning" | "critical";
 
 export interface Subject {
   id: string;
@@ -53,9 +40,11 @@ export interface CalendarSession {
   source: "portal" | "manual";
 }
 
+export type TimetableSyncStatus = "idle" | "ready" | "error" | "session-expired";
+
 export interface TimetableSyncState {
   source: "portal" | "manual" | "none";
-  status: "idle" | "ready" | "error";
+  status: TimetableSyncStatus;
   lastSyncedAt?: string;
   rangeStart?: string;
   rangeEnd?: string;
@@ -63,22 +52,14 @@ export interface TimetableSyncState {
 }
 
 export interface AttendancePolicy {
+  /**
+   * NIET requires 75% in each theory and practical subject individually
+   * (Attendance Policy 2025-26, section 1). This threshold is therefore
+   * applied per subject, not to the aggregate.
+   */
   thresholdPercent: number;
+  /** Floor below which severe-medical condonation cannot be granted. */
   severeMedicalFloorPercent: number;
-  weightageByCategory: Record<AttendanceAdjustmentCategory, number>;
-}
-
-export interface AttendanceAdjustment {
-  id: string;
-  subjectIds: string[];
-  category: AttendanceAdjustmentCategory;
-  source: AttendanceAdjustmentSource;
-  approvalStatus: ApprovalStatus;
-  fromDate: string;
-  toDate: string;
-  impactedClasses: number;
-  creditedClasses: number;
-  notes?: string;
 }
 
 export interface ERPImportSnapshot {
@@ -98,6 +79,8 @@ export interface ERPImportSnapshot {
     studentName?: string;
     semesterLabel?: string;
     branch?: string;
+    section?: string;
+    rollNo?: string;
   };
 }
 
@@ -105,7 +88,9 @@ export interface StudentProfile {
   institute: string;
   studentName: string;
   branch: string;
+  section: string;
   semesterLabel: string;
+  rollNo: string;
   studentEmail: string;
 }
 
@@ -132,7 +117,7 @@ export interface SubjectProjection {
   classesMissed: number;
   bunkableClasses: number;
   recoveryClassesNeeded: number;
-  status: "safe" | "warning" | "critical";
+  status: RiskStatus;
 }
 
 export interface SimulationResult {
@@ -150,8 +135,13 @@ export interface SimulationResult {
     classesMissed: number;
     recoveryClassesNeeded: number;
     recoveryDaysNeeded: number;
+    /** True when the synced schedule ends before recovery is achievable. */
+    recoveryBeyondSchedule: boolean;
     safeLeaveDaysRemaining: number;
-    status: "safe" | "warning" | "critical";
+    /** Worst per-subject status after the simulated absence. */
+    status: RiskStatus;
+    /** Subject that breaches the threshold first, if any. */
+    bindingSubjectName?: string;
   };
   summary: {
     impactedSubjects: number;
@@ -174,9 +164,13 @@ export interface AttendanceStore {
   timetable: ScheduleSlot[];
   calendarSessions: CalendarSession[];
   timetableSync: TimetableSyncState;
-  adjustments: AttendanceAdjustment[];
   simulations: SimulationRecord[];
   erpSnapshots: ERPImportSnapshot[];
+  /** Semester the stored subjects belong to; guards against rollover clobbering. */
+  activeSemesterLabel: string;
+  preferences: {
+    showPageOverlay: boolean;
+  };
 }
 
 export interface DashboardSubject {
@@ -191,7 +185,7 @@ export interface DashboardSubject {
   bunkableClasses: number;
   recoveryClassesNeeded: number;
   severeMedicalEligible: boolean;
-  status: "safe" | "warning" | "critical" | "not-started";
+  status: RiskStatus | "not-started";
 }
 
 export interface DashboardData {
@@ -200,18 +194,29 @@ export interface DashboardData {
   overall: {
     attendedClasses: number;
     heldClasses: number;
+    /** Aggregate percentage. Shown for cross-checking against the ERP only. */
     attendancePercent: number;
     nextMissDropPercent: number;
-    bunkableClasses: number;
+    /**
+     * Classes that can be missed while every subject stays at or above the
+     * threshold. This is the minimum across started subjects, NOT the figure
+     * derived from aggregate totals.
+     */
+    safeToMissClasses: number;
+    /** Subject with the least headroom; the constraint the student feels. */
+    bindingSubjectId?: string;
+    bindingSubjectName?: string;
+    bindingSubjectPercent?: number;
     safeLeaveDays: number;
+    /** Classes needed to bring every subject back to the threshold. */
     recoveryClassesNeeded: number;
-    status: "safe" | "warning" | "critical";
+    /** Worst status across started subjects. */
+    status: RiskStatus;
   };
   subjects: DashboardSubject[];
   timetable: ScheduleSlot[];
   calendarSessions: CalendarSession[];
   timetableSync: TimetableSyncState;
-  adjustments: AttendanceAdjustment[];
   recentSimulation?: SimulationResult;
   erpSnapshot?: ERPImportSnapshot;
   insights: {

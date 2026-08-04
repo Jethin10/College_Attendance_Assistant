@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "NIET Attendance Planner",
-  "version": "2.0.0",
-  "description": "Auto-detects your NIET ERP attendance and tells you if it is safe to take leave. See bunkable classes, safe leave days, and simulate leave impact without leaving the ERP page.",
+  "version": "1.0.0",
+  "description": "See how many classes you can safely miss. Reads your NIET ERP attendance and tracks the 75% requirement for every subject individually.",
   "icons": {
     "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
   },
-  "permissions": ["storage", "scripting", "tabs"],
+  "permissions": ["storage", "scripting"],
   "host_permissions": ["*://nietcloud.niet.co.in/*"],
   "background": {
     "service_worker": "service-worker.js",
@@ -27,6 +28,7 @@
     "default_title": "NIET Attendance Planner",
     "default_icon": {
       "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     }
