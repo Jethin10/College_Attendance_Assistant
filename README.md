@@ -7,23 +7,26 @@ Everything stays on your device. No server, no account, no analytics.
 
 ---
 
-## Why the number in this extension differs from the ERP's
+## Which rule it applies
 
-The ERP shows your **overall** attendance. NIET's policy is stricter than that:
+The verdict is based on your **overall** attendance — the same figure the ERP
+shows and the one the institute enforces in practice. If the extension and the
+portal ever disagree, that is a bug.
 
-> Every student must maintain a minimum of **75% attendance in each theory and
-> practical subject individually**. So that overall attendance will be
-> maintained above 75%.
->
-> — *NIET Attendance Policy, Academic Year 2025–26, §1*
+The signed [Attendance Policy 2025-26](attendance_policy_2025_26.pdf) §1 also
+asks for 75% in *each* subject individually:
 
-Those are not the same requirement. You can sit at 82% overall while one
-subject is at 71% — and that single subject is enough to have you detained
-from sessional and end-semester exams (§13).
+> Every student must maintain a minimum of 75% attendance in each theory and
+> practical subject individually.
 
-So this extension leads with your **weakest** subject, not your average. When it
-says "safe to miss 3 classes", that is the number your worst subject can
-absorb, and it names which subject is holding you back.
+That clause is not currently enforced, so the extension does not treat it as a
+verdict — telling you "not safe" while the institute considers you fine would
+be worse than useless. A subject below 75% is instead shown as a quiet note, so
+you know about it without it overriding your actual standing.
+
+If enforcement changes, flipping `enforcePerSubject` in
+`src/lib/storage.ts` switches every calculation back to weakest-subject
+behaviour. That path is covered by tests.
 
 ---
 
@@ -35,9 +38,9 @@ absorb, and it names which subject is holding you back.
 - **Syncs your real timetable** for the next 45 days, with actual dates, so
   leave planning accounts for the days you actually have class
 - **Plans leave** — pick days off, a date range, or a number of classes, and see
-  the effect on every subject before you commit
+  the effect before you commit
 - **Shows a summary on the ERP page** above your attendance table (dismissible)
-- **Badges the toolbar icon** with your lowest subject percentage
+- **Badges the toolbar icon** with your overall percentage
 
 ## What it does not do
 
@@ -103,8 +106,9 @@ first. It is deliberately free of Chrome APIs so it can be tested directly.
 Tests are bundled with esbuild (so the `@/` alias resolves) and run under
 node's built-in test runner. No test framework dependency.
 
-The most important test is `a healthy average does not hide a failing subject`
-— it is the regression guard for the per-subject rule described above.
+The most important tests are `missed classes are attributed to the subject that
+owns them` (guards the session/subject id reconciliation) and `per-subject mode
+still works when the clause is enforced` (guards the policy escape hatch).
 
 ---
 

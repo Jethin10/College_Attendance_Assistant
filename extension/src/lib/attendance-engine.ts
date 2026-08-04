@@ -1,18 +1,15 @@
 /**
  * Attendance engine.
  *
- * IMPORTANT — the threshold is per subject, not aggregate.
+ * The verdict is driven by OVERALL attendance, which is what NIET enforces in
+ * practice and what the ERP displays.
  *
- * NIET Attendance Policy 2025-26, section 1:
- *   "Every student must maintain a minimum of 75% attendance in each theory
- *    and practical subject individually. So that overall attendance will be
- *    maintained above 75%."
- *
- * A student can therefore sit above 75% overall while a single subject is
- * below it and they are already detainable. Every "is it safe to miss a
- * class" answer in this file is consequently driven by the WORST subject,
- * and aggregate percentages are reported only so the student can cross-check
- * against what the ERP displays.
+ * The signed Attendance Policy 2025-26 (section 1) also requires 75% in each
+ * theory and practical subject individually, but that clause is not currently
+ * enforced. Reporting on it as the verdict would tell students they are unsafe
+ * when the institute considers them fine, so per-subject shortfalls are kept as
+ * an advisory note instead. `policy.enforcePerSubject` flips the verdict back
+ * to the weakest subject if that ever changes.
  */
 
 import {
@@ -290,15 +287,93 @@ function safeLeaveDaysFromSlots(args: {
 }
 
 /**
+ * Overall mode: consecutive days off until the total missed classes would push
+ * overall attendance below the threshold. Subject identity is irrelevant here.
+ */
+function safeLeaveDaysFromSharedBudget(args: {
+  budget: number;
+  timetable: ScheduleSlot[];
+  calendarSessions: CalendarSession[];
+  startDate?: Date;
+}) {
+  if (args.budget <= 0) {
+    return 0;
+  }
+
+  let remaining = args.budget;
+  let leaveDays = 0;
+
+  if (args.calendarSessions.length > 0) {
+    const byDate = sessionsByDateAndSubject(args.calendarSessions, args.startDate);
+
+    for (const dateKey of [...byDate.keys()].sort((a, b) => a.localeCompare(b))) {
+      const classes = [...byDate.get(dateKey)!.values()].reduce((sum, n) => sum + n, 0);
+      if (classes > remaining) {
+        return leaveDays;
+      }
+      remaining -= classes;
+      leaveDays += 1;
+    }
+  }
+
+  if (args.timetable.length === 0 || remaining <= 0) {
+    return leaveDays;
+  }
+
+  // Continue past the synced range using the repeating weekly pattern.
+  const classesByDay = new Map<number, number>();
+  for (const slot of args.timetable) {
+    classesByDay.set(slot.dayOfWeek, (classesByDay.get(slot.dayOfWeek) ?? 0) + 1);
+  }
+
+  const lastSession = latestCalendarSession(args.calendarSessions);
+  const cursor = lastSession
+    ? startOfDay(sessionStartDate(lastSession))
+    : startOfDay(args.startDate ?? new Date());
+  if (lastSession) {
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  for (let i = 0; i < PROJECTION_DAY_LIMIT; i += 1) {
+    const classes = classesByDay.get(cursor.getDay()) ?? 0;
+    if (classes > 0) {
+      if (classes > remaining) {
+        break;
+      }
+      remaining -= classes;
+      leaveDays += 1;
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  return leaveDays;
+}
+
+/**
  * Safe full days off, preferring the portal's dated schedule and continuing
  * with the repeating weekly timetable once those dates run out.
+ *
+ * `sharedBudget` switches to overall mode: every missed class draws on one
+ * pool regardless of subject, which is how the institute actually counts.
+ * Without it, each subject carries its own allowance and a day is only safe
+ * when every subject meeting that day can absorb its own hit.
  */
 function computeSafeLeaveDays(args: {
   budgets: Map<string, number>;
   timetable: ScheduleSlot[];
   calendarSessions: CalendarSession[];
   startDate?: Date;
+  sharedBudget?: number;
 }) {
+  if (args.sharedBudget !== undefined) {
+    return safeLeaveDaysFromSharedBudget({
+      budget: args.sharedBudget,
+      timetable: args.timetable,
+      calendarSessions: args.calendarSessions,
+      startDate: args.startDate,
+    });
+  }
+
   const anyBudget = [...args.budgets.values()].some((value) => value > 0);
   if (!anyBudget) {
     return 0;
@@ -418,6 +493,64 @@ function computeRecoveryDays(args: {
   return { days, beyondSchedule: outstanding.size > 0 };
 }
 
+/**
+ * Overall mode: days of attendance needed to claw back a single pooled
+ * shortfall. Every class counts, regardless of which subject it belongs to.
+ */
+function computeRecoveryDaysOverall(args: {
+  classesNeeded: number;
+  timetable: ScheduleSlot[];
+  calendarSessions: CalendarSession[];
+  startDate?: Date;
+}): { days: number; beyondSchedule: boolean } {
+  if (args.classesNeeded <= 0) {
+    return { days: 0, beyondSchedule: false };
+  }
+
+  let outstanding = args.classesNeeded;
+  let days = 0;
+
+  if (args.calendarSessions.length > 0) {
+    const byDate = sessionsByDateAndSubject(args.calendarSessions, args.startDate);
+    for (const dateKey of [...byDate.keys()].sort((a, b) => a.localeCompare(b))) {
+      const classes = [...byDate.get(dateKey)!.values()].reduce((sum, n) => sum + n, 0);
+      outstanding -= classes;
+      days += 1;
+      if (outstanding <= 0) {
+        return { days, beyondSchedule: false };
+      }
+    }
+  }
+
+  if (args.timetable.length === 0) {
+    return { days, beyondSchedule: outstanding > 0 };
+  }
+
+  const classesByDay = new Map<number, number>();
+  for (const slot of args.timetable) {
+    classesByDay.set(slot.dayOfWeek, (classesByDay.get(slot.dayOfWeek) ?? 0) + 1);
+  }
+
+  const lastSession = latestCalendarSession(args.calendarSessions);
+  const cursor = lastSession
+    ? startOfDay(sessionStartDate(lastSession))
+    : startOfDay(args.startDate ?? new Date());
+  if (lastSession) {
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  for (let i = 0; i < PROJECTION_DAY_LIMIT && outstanding > 0; i += 1) {
+    const classes = classesByDay.get(cursor.getDay()) ?? 0;
+    if (classes > 0) {
+      outstanding -= classes;
+      days += 1;
+    }
+    cursor.setDate(cursor.getDate() + 1);
+  }
+
+  return { days, beyondSchedule: outstanding > 0 };
+}
+
 function totalsOf(subjects: Subject[]) {
   return {
     totalAttended: subjects.reduce((sum, s) => sum + s.attendedClasses, 0),
@@ -476,21 +609,39 @@ export function buildDashboardData(input: {
   // would force the minimum to 0 and report a false "not safe".
   const started = subjects.filter((subject) => subject.status !== "not-started");
 
-  // The binding constraint: least headroom, tie-broken by lowest percentage.
-  const binding = [...started].sort(
+  // Weakest subject — advisory context, and the verdict only when the
+  // per-subject clause is being enforced.
+  const weakest = [...started].sort(
     (a, b) =>
       a.bunkableClasses - b.bunkableClasses ||
       a.attendancePercent - b.attendancePercent,
   )[0];
 
-  const safeToMissClasses = started.length > 0 ? binding.bunkableClasses : 0;
+  const overallPercent = computeAttendancePercent(totalAttended, totalHeld);
+  const overallBunkable = computeBunkableClasses(totalAttended, totalHeld, threshold);
+  const overallRecovery = computeRecoveryClassesNeeded(totalAttended, totalHeld, threshold);
+  const overallStatus = getSubjectStatus(overallPercent, threshold);
 
-  const budgets = new Map(
-    subjects.map((subject) => [
-      subject.id,
-      subject.status === "not-started" ? Number.POSITIVE_INFINITY : subject.bunkableClasses,
-    ]),
-  );
+  const perSubject = input.policy.enforcePerSubject;
+
+  const safeToMissClasses = started.length === 0
+    ? 0
+    : perSubject
+      ? weakest.bunkableClasses
+      : overallBunkable;
+
+  const budgets = perSubject
+    ? new Map(
+        subjects.map((subject) => [
+          subject.id,
+          subject.status === "not-started"
+            ? Number.POSITIVE_INFINITY
+            : subject.bunkableClasses,
+        ]),
+      )
+    : // Overall mode: any class counts against one shared budget, so give every
+      // subject the same pool rather than an individual allowance.
+      new Map(subjects.map((subject) => [subject.id, overallBunkable]));
 
   const averageAttendance =
     started.reduce((sum, subject) => sum + subject.attendancePercent, 0) /
@@ -502,23 +653,29 @@ export function buildDashboardData(input: {
     overall: {
       attendedClasses: round(totalAttended),
       heldClasses: round(totalHeld),
-      attendancePercent: computeAttendancePercent(totalAttended, totalHeld),
-      nextMissDropPercent: binding?.nextMissDropPercent ?? 0,
+      attendancePercent: overallPercent,
+      nextMissDropPercent: perSubject
+        ? (weakest?.nextMissDropPercent ?? 0)
+        : computeNextMissDrop(totalAttended, totalHeld),
       safeToMissClasses,
-      bindingSubjectId: binding?.id,
-      bindingSubjectName: binding?.name,
-      bindingSubjectPercent: binding?.attendancePercent,
       safeLeaveDays: computeSafeLeaveDays({
         budgets,
         timetable: input.timetable,
         calendarSessions: input.calendarSessions,
         startDate: new Date(),
+        sharedBudget: perSubject ? undefined : overallBunkable,
       }),
-      recoveryClassesNeeded: started.reduce(
-        (sum, subject) => sum + subject.recoveryClassesNeeded,
-        0,
-      ),
-      status: started.length > 0 ? worstStatus(started.map((s) => s.status as RiskStatus)) : "safe",
+      recoveryClassesNeeded: perSubject
+        ? started.reduce((sum, subject) => sum + subject.recoveryClassesNeeded, 0)
+        : overallRecovery,
+      status: started.length === 0
+        ? "safe"
+        : perSubject
+          ? worstStatus(started.map((s) => s.status as RiskStatus))
+          : overallStatus,
+      weakestSubjectId: weakest?.id,
+      weakestSubjectName: weakest?.name,
+      weakestSubjectPercent: weakest?.attendancePercent,
     },
     subjects,
     timetable: input.timetable,
@@ -531,8 +688,9 @@ export function buildDashboardData(input: {
       belowThresholdCount: started.filter(
         (subject) => subject.attendancePercent < threshold,
       ).length,
-      explanation:
-        "NIET requires 75% in every subject individually, so the headline figure tracks your weakest subject rather than your average. Missing a class costs more early in the semester, when the total is still small.",
+      explanation: perSubject
+        ? "Your weakest subject sets the limit, because 75% is required in each subject individually."
+        : "Based on your overall attendance, which is what the institute enforces. Missing a class costs more early in the semester, when the total is still small.",
     },
   };
 }
@@ -939,38 +1097,68 @@ export function simulateAttendance(args: {
     getSubjectStatus(computeAttendancePercent(subject.attended, subject.held), threshold),
   );
 
-  const budgets = new Map(
-    afterSubjects.map((subject) => [
-      subject.id,
-      subject.started
-        ? computeBunkableClasses(subject.attended, subject.held, threshold)
-        : Number.POSITIVE_INFINITY,
-    ]),
+  const perSubject = args.policy.enforcePerSubject;
+
+  const overallAfterBunkable = computeBunkableClasses(
+    totalAttended,
+    overallAfterHeld,
+    threshold,
   );
-
-  const recoveryBySubject = new Map(
-    afterSubjects.map((subject) => [
-      subject.id,
-      subject.started
-        ? computeRecoveryClassesNeeded(subject.attended, subject.held, threshold)
-        : 0,
-    ]),
+  const overallAfterRecovery = computeRecoveryClassesNeeded(
+    totalAttended,
+    overallAfterHeld,
+    threshold,
   );
+  const overallAfterStatus = getSubjectStatus(overallAfterPercent, threshold);
 
-  const overallRecoveryClassesNeeded = [...recoveryBySubject.values()].reduce(
-    (sum, need) => sum + need,
-    0,
-  );
+  const budgets = perSubject
+    ? new Map(
+        afterSubjects.map((subject) => [
+          subject.id,
+          subject.started
+            ? computeBunkableClasses(subject.attended, subject.held, threshold)
+            : Number.POSITIVE_INFINITY,
+        ]),
+      )
+    : new Map(afterSubjects.map((subject) => [subject.id, overallAfterBunkable]));
 
-  const recovery = computeRecoveryDays({
-    needBySubject: recoveryBySubject,
-    timetable: args.timetable,
-    calendarSessions: args.calendarSessions,
-    startDate: new Date(),
-  });
+  const recoveryBySubject = perSubject
+    ? new Map(
+        afterSubjects.map((subject) => [
+          subject.id,
+          subject.started
+            ? computeRecoveryClassesNeeded(subject.attended, subject.held, threshold)
+            : 0,
+        ]),
+      )
+    : // Overall mode: recovery is a single pool, so charge it against whichever
+      // classes come next rather than to any one subject.
+      new Map(
+        afterSubjects.length > 0
+          ? [[afterSubjects[0].id, overallAfterRecovery] as const]
+          : [],
+      );
 
-  // Worst subject after the absence — the one that decides whether this is safe.
-  const bindingAfter = [...afterStarted]
+  const overallRecoveryClassesNeeded = perSubject
+    ? [...recoveryBySubject.values()].reduce((sum, need) => sum + need, 0)
+    : overallAfterRecovery;
+
+  const recovery = perSubject
+    ? computeRecoveryDays({
+        needBySubject: recoveryBySubject,
+        timetable: args.timetable,
+        calendarSessions: args.calendarSessions,
+        startDate: new Date(),
+      })
+    : computeRecoveryDaysOverall({
+        classesNeeded: overallAfterRecovery,
+        timetable: args.timetable,
+        calendarSessions: args.calendarSessions,
+        startDate: new Date(),
+      });
+
+  // Weakest subject after the absence — advisory unless per-subject is enforced.
+  const weakestAfter = [...afterStarted]
     .map((subject) => ({
       name: subject.name,
       percent: computeAttendancePercent(subject.attended, subject.held),
@@ -999,9 +1187,13 @@ export function simulateAttendance(args: {
         timetable: args.timetable,
         calendarSessions: args.calendarSessions,
         startDate: new Date(),
+        sharedBudget: perSubject ? undefined : overallAfterBunkable,
       }),
-      status: afterStatuses.length > 0 ? worstStatus(afterStatuses) : "safe",
-      bindingSubjectName: bindingAfter?.name,
+      status: perSubject
+        ? (afterStatuses.length > 0 ? worstStatus(afterStatuses) : "safe")
+        : overallAfterStatus,
+      weakestSubjectName: weakestAfter?.name,
+      weakestSubjectPercent: weakestAfter?.percent,
     },
     summary: {
       impactedSubjects: projections.length,

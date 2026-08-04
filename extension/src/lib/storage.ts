@@ -23,10 +23,17 @@ const STORE_KEY = "attendance_store";
 const MAX_SNAPSHOTS = 50;
 const MAX_SIMULATIONS = 25;
 
-/** NIET Attendance Policy 2025-26: 75% per subject, 60% floor for condonation. */
+/**
+ * NIET Attendance Policy 2025-26: 75% required, 60% floor for condonation.
+ *
+ * `enforcePerSubject` is false because only the overall percentage is being
+ * enforced in practice, even though section 1 of the signed policy specifies
+ * per-subject. Per-subject shortfalls still surface as an advisory note.
+ */
 const DEFAULT_POLICY: AttendancePolicy = {
   thresholdPercent: 75,
   severeMedicalFloorPercent: 60,
+  enforcePerSubject: false,
 };
 
 function defaultStudent(): StudentProfile {
@@ -65,7 +72,10 @@ function migrate(stored: Partial<AttendanceStore>): AttendanceStore {
 
   return {
     student: { ...base.student, ...(stored.student ?? {}) },
-    policy: { ...base.policy, ...(stored.policy ?? {}) },
+    // Policy is intentionally not spread from storage: it encodes institute
+    // rules, not user preferences, so a stored copy must never pin an outdated
+    // interpretation (e.g. per-subject enforcement) after a policy change.
+    policy: base.policy,
     subjects: stored.subjects ?? [],
     timetable: stored.timetable ?? [],
     calendarSessions: stored.calendarSessions ?? [],
@@ -147,6 +157,118 @@ function normalizeCode(code: string) {
   return code.replace(/[^a-z0-9]/gi, "").toLowerCase();
 }
 
+function normalizeName(name: string) {
+  return name
+    .toLowerCase()
+    .replace(/\b(lab|laboratory|practical|theory|using|with|and|of|the)\b/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+/**
+ * Points calendar sessions at the subject they belong to.
+ *
+ * The timetable feed identifies a class by course code or short name, while
+ * subjects are keyed by a semester-namespaced id derived from the attendance
+ * table. Those two never agree on their own, so sessions must be re-matched
+ * every time either side changes — matching once at sync time leaves sessions
+ * orphaned as soon as attendance re-imports and renames the subject ids.
+ *
+ * An orphaned session is not cosmetic: the simulator counts missed classes by
+ * subject id, so orphans silently vanish from per-subject impact while still
+ * inflating the totals.
+ *
+ * Matching is deliberately strict. An earlier prefix-based fallback returned
+ * the first loose match, which funnelled unrelated sessions into a single
+ * subject and made one subject appear to absorb an entire absence.
+ */
+export function reconcileSessionsToSubjects(
+  sessions: CalendarSession[],
+  subjects: Subject[],
+): CalendarSession[] {
+  if (subjects.length === 0) {
+    return sessions;
+  }
+
+  const byCode = new Map(subjects.map((s) => [normalizeCode(s.code), s]));
+  const byId = new Map(subjects.map((s) => [s.id, s]));
+  const byName = new Map<string, Subject>();
+
+  // Ambiguous names must not match anything, so track and drop collisions.
+  const nameCollisions = new Set<string>();
+  for (const subject of subjects) {
+    const key = normalizeName(subject.name);
+    if (!key) continue;
+    if (byName.has(key)) {
+      nameCollisions.add(key);
+    } else {
+      byName.set(key, subject);
+    }
+  }
+  for (const key of nameCollisions) {
+    byName.delete(key);
+  }
+
+  const resolve = (session: CalendarSession) => {
+    // Already pointing at a known subject.
+    if (byId.has(session.subjectId)) {
+      return session.subjectId;
+    }
+
+    const byExactCode =
+      byCode.get(normalizeCode(session.subjectCode)) ??
+      byCode.get(normalizeCode(session.subjectId));
+    if (byExactCode) {
+      return byExactCode.id;
+    }
+
+    const nameKey = normalizeName(session.subjectName);
+    const byExactName = nameKey ? byName.get(nameKey) : undefined;
+    if (byExactName) {
+      return byExactName.id;
+    }
+
+    // Unmatched: keep the feed's own id so the session still counts toward
+    // schedule density, rather than being attributed to the wrong subject.
+    return session.subjectId;
+  };
+
+  return sessions.map((session) => ({ ...session, subjectId: resolve(session) }));
+}
+
+/** Weekly slots carry a course code in subjectId; align them the same way. */
+function reconcileTimetableToSubjects(
+  timetable: ScheduleSlot[],
+  sessions: CalendarSession[],
+  subjects: Subject[],
+): ScheduleSlot[] {
+  if (subjects.length === 0) {
+    return timetable;
+  }
+
+  const byId = new Map(subjects.map((s) => [s.id, s]));
+  const byCode = new Map(subjects.map((s) => [normalizeCode(s.code), s]));
+
+  // Sessions already resolved above are the most reliable bridge from a raw
+  // feed code to a subject id.
+  const resolvedByRawCode = new Map<string, string>();
+  for (const session of sessions) {
+    if (byId.has(session.subjectId)) {
+      resolvedByRawCode.set(normalizeCode(session.subjectCode), session.subjectId);
+    }
+  }
+
+  return timetable.map((slot) => {
+    if (byId.has(slot.subjectId)) {
+      return slot;
+    }
+
+    const raw = normalizeCode(slot.subjectId);
+    const resolved = resolvedByRawCode.get(raw) ?? byCode.get(raw)?.id;
+    return resolved ? { ...slot, subjectId: resolved } : slot;
+  });
+}
+
 export async function savePortalTimetable(args: {
   timetable: ScheduleSlot[];
   calendarSessions: CalendarSession[];
@@ -156,41 +278,16 @@ export async function savePortalTimetable(args: {
 }): Promise<DashboardData> {
   const store = await readStore();
 
-  const byCode = new Map(
-    store.subjects.map((subject) => [normalizeCode(subject.code), subject]),
+  const reconciledSessions = reconcileSessionsToSubjects(
+    args.calendarSessions,
+    store.subjects,
   );
 
-  /**
-   * The timetable feed and the attendance table name subjects differently, so
-   * match on an exact normalised code first, then on a prefix either way
-   * ("CS301" vs "CS301A"). Falls back to the feed's own id.
-   */
-  const resolveSubjectId = (subjectCode: string, fallbackId: string) => {
-    const normalized = normalizeCode(subjectCode);
-    const direct = byCode.get(normalized);
-    if (direct) {
-      return direct.id;
-    }
-
-    for (const [code, subject] of byCode.entries()) {
-      if (code.startsWith(normalized) || normalized.startsWith(code)) {
-        return subject.id;
-      }
-    }
-
-    return fallbackId;
-  };
-
-  const reconciledSessions = args.calendarSessions.map((session) => ({
-    ...session,
-    subjectId: resolveSubjectId(session.subjectCode, session.subjectId),
-  }));
-
-  // Weekly slots carry a subject code in subjectId (set by the content script).
-  store.timetable = args.timetable.map((slot) => ({
-    ...slot,
-    subjectId: resolveSubjectId(slot.subjectId, slot.subjectId),
-  }));
+  store.timetable = reconcileTimetableToSubjects(
+    args.timetable,
+    reconciledSessions,
+    store.subjects,
+  );
   store.calendarSessions = reconciledSessions;
   store.timetableSync = {
     source: "portal",
@@ -326,6 +423,19 @@ export async function saveErpSnapshot(
       attendedClasses: parsed.attendedClasses,
     };
   });
+
+  // Subject ids may have just changed (new semester, or the first attendance
+  // sync after a timetable-only sync), which would orphan every stored session
+  // and silently drop it from per-subject impact. Re-match against the new ids.
+  store.calendarSessions = reconcileSessionsToSubjects(
+    store.calendarSessions,
+    store.subjects,
+  );
+  store.timetable = reconcileTimetableToSubjects(
+    store.timetable,
+    store.calendarSessions,
+    store.subjects,
+  );
 
   await writeStore(store);
   return getDashboardData();

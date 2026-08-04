@@ -550,25 +550,18 @@ function injectOverlayBadges() {
 
   const started = subjects.filter((subject) => subject.heldClasses > 0);
 
-  // The binding constraint is the worst subject, not the aggregate: NIET
-  // requires 75% in every subject individually.
-  const headroom = started.map((subject) =>
-    computeBunkableClasses(subject.attendedClasses, subject.heldClasses, THRESHOLD),
-  );
-  const safeToMiss = headroom.length > 0 ? Math.min(...headroom) : 0;
-  const worstPercent =
-    started.length > 0
-      ? Math.min(
-          ...started.map((subject) =>
-            computeAttendancePercent(subject.attendedClasses, subject.heldClasses),
-          ),
-        )
-      : 100;
-  const overallStatus = getSubjectStatus(worstPercent, THRESHOLD);
-
   const totalAttended = subjects.reduce((sum, s) => sum + s.attendedClasses, 0);
   const totalHeld = subjects.reduce((sum, s) => sum + s.heldClasses, 0);
+
+  // Overall is what the institute enforces, so the bar reports on that and the
+  // number always agrees with the portal's own figure.
   const overallPercent = computeAttendancePercent(totalAttended, totalHeld);
+  const safeToMiss = computeBunkableClasses(totalAttended, totalHeld, THRESHOLD);
+  const overallStatus = getSubjectStatus(overallPercent, THRESHOLD);
+  const belowCount = started.filter(
+    (subject) =>
+      computeAttendancePercent(subject.attendedClasses, subject.heldClasses) < THRESHOLD,
+  ).length;
 
   const summaryBar = document.createElement("div");
   summaryBar.setAttribute(OVERLAY_ATTR, "summary");
@@ -578,23 +571,27 @@ function injectOverlayBadges() {
   brand.className = "niet-planner-summary__brand";
   brand.innerHTML = `
     <span class="niet-planner-summary__logo">Attendance Planner</span>
-    <span class="niet-planner-summary__caption">Lowest subject decides your limit</span>
+    <span class="niet-planner-summary__caption">${
+      belowCount > 0
+        ? `${belowCount} subject${belowCount === 1 ? "" : "s"} below 75%`
+        : "Based on your overall attendance"
+    }</span>
   `;
 
   const stats = document.createElement("div");
   stats.className = "niet-planner-summary__stats";
   stats.innerHTML = `
     <span class="niet-planner-summary__stat">
+      Overall
+      <strong class="niet-planner-status--${overallStatus}">${overallPercent}%</strong>
+    </span>
+    <span class="niet-planner-summary__stat">
       Safe to miss
       <strong class="niet-planner-status--${overallStatus}">${safeToMiss}</strong>
     </span>
     <span class="niet-planner-summary__stat">
-      Lowest subject
-      <strong class="niet-planner-status--${overallStatus}">${worstPercent}%</strong>
-    </span>
-    <span class="niet-planner-summary__stat">
-      Overall
-      <strong>${overallPercent}%</strong>
+      Classes
+      <strong>${totalAttended}/${totalHeld}</strong>
     </span>
   `;
 
@@ -654,33 +651,26 @@ function injectOverlayBadges() {
       subject.attendedClasses,
       subject.heldClasses,
     );
-    const bunkable = computeBunkableClasses(
-      subject.attendedClasses,
-      subject.heldClasses,
-      THRESHOLD,
-    );
     const recovery = computeRecoveryClassesNeeded(
       subject.attendedClasses,
       subject.heldClasses,
       THRESHOLD,
     );
-    const status = getSubjectStatus(percent, THRESHOLD);
 
     const badge = document.createElement("span");
     badge.setAttribute(OVERLAY_ATTR, "badge");
 
+    // Per-row badges report only this subject's own standing. They do not claim
+    // it is safe to miss a class, because that depends on the overall figure.
     if (subject.heldClasses === 0) {
       badge.className = "niet-planner-badge niet-planner-badge--neutral";
       badge.textContent = "Not started";
-    } else if (status === "critical") {
+    } else if (percent < THRESHOLD) {
       badge.className = "niet-planner-badge niet-planner-badge--critical";
-      badge.textContent = `Attend ${recovery} to recover`;
-    } else if (bunkable === 0) {
-      badge.className = "niet-planner-badge niet-planner-badge--warning";
-      badge.textContent = "No margin left";
+      badge.textContent = `${recovery} to reach 75%`;
     } else {
-      badge.className = `niet-planner-badge niet-planner-badge--${status}`;
-      badge.textContent = `${bunkable} to spare`;
+      badge.className = "niet-planner-badge niet-planner-badge--safe";
+      badge.textContent = "Above 75%";
     }
 
     cells[cells.length - 1].appendChild(badge);

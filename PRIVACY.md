@@ -53,7 +53,8 @@ in general, or any other website.
 ## Accuracy
 
 Figures shown are estimates calculated from what the ERP reports, and are
-provided for planning only. Approved OD, medical condonation, and similar
+provided for planning only. They are based on overall attendance, which is what
+the institute enforces. Approved OD, medical condonation, and similar
 adjustments are not counted. The ERP remains the authoritative record — always
 confirm there before making a decision that matters.
 

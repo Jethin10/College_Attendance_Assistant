@@ -30,7 +30,11 @@ import type {
 const POLICY: AttendancePolicy = {
   thresholdPercent: 75,
   severeMedicalFloorPercent: 60,
+  enforcePerSubject: false,
 };
+
+/** Policy variant for when the per-subject clause is enforced again. */
+const PER_SUBJECT_POLICY: AttendancePolicy = { ...POLICY, enforcePerSubject: true };
 
 const STUDENT: StudentProfile = {
   institute: "NIET Greater Noida",
@@ -58,10 +62,11 @@ function subject(overrides: Partial<Subject> & Pick<Subject, "id">): Subject {
 function dashboard(subjects: Subject[], extras?: {
   timetable?: ScheduleSlot[];
   calendarSessions?: CalendarSession[];
+  policy?: AttendancePolicy;
 }) {
   return buildDashboardData({
     student: STUDENT,
-    policy: POLICY,
+    policy: extras?.policy ?? POLICY,
     subjects,
     timetable: extras?.timetable ?? [],
     calendarSessions: extras?.calendarSessions ?? [],
@@ -141,40 +146,70 @@ test("getSubjectStatus separates critical, warning and safe", () => {
 
 /* --------------------------- the policy rule --------------------------- */
 
-test("a healthy average does not hide a failing subject", () => {
-  // Aggregate: 155/200 = 77.5%, comfortably above 75.
-  // Maths alone: 68/100 = 68%, already detainable.
+test("a failing subject does not override a healthy overall figure", () => {
+  // Aggregate: 155/200 = 77.5%, which is what the institute enforces.
+  // Maths alone is at 68%, but that clause is not currently enforced.
   const data = dashboard([
     subject({ id: "maths", name: "Maths", attendedClasses: 68, heldClasses: 100 }),
     subject({ id: "dsa", name: "DSA", attendedClasses: 87, heldClasses: 100 }),
   ]);
 
   assert.equal(data.overall.attendancePercent, 77.5);
-  assert.equal(data.overall.status, "critical", "must not report safe");
-  assert.equal(data.overall.safeToMissClasses, 0);
-  assert.equal(data.overall.bindingSubjectName, "Maths");
+  // 77.5% is above the line but inside the 5-point warning band.
+  assert.equal(data.overall.status, "warning");
+  assert.notEqual(data.overall.status, "critical", "a weak subject must not force critical");
+  assert.equal(data.overall.safeToMissClasses, computeBunkableClasses(155, 200, 75));
+  // Still surfaced, so the popup can show an advisory note.
+  assert.equal(data.overall.weakestSubjectName, "Maths");
+  assert.equal(data.insights.belowThresholdCount, 1);
 });
 
-test("safeToMissClasses is the minimum across subjects, not the aggregate", () => {
+test("safeToMissClasses uses the overall pool", () => {
   const data = dashboard([
-    subject({ id: "a", name: "A", attendedClasses: 76, heldClasses: 100 }), // 1 spare
-    subject({ id: "b", name: "B", attendedClasses: 95, heldClasses: 100 }), // 26 spare
+    subject({ id: "a", name: "A", attendedClasses: 76, heldClasses: 100 }),
+    subject({ id: "b", name: "B", attendedClasses: 95, heldClasses: 100 }),
   ]);
 
-  // Pooling totals would allow 24; the weakest subject allows 1.
-  assert.equal(computeBunkableClasses(171, 200, 75), 28);
-  assert.equal(data.overall.safeToMissClasses, 1);
-  assert.equal(data.overall.bindingSubjectName, "A");
+  // 171/200 = 85.5%; the pooled allowance is what matters now.
+  assert.equal(data.overall.safeToMissClasses, computeBunkableClasses(171, 200, 75));
+  assert.equal(data.overall.safeToMissClasses, 28);
 });
 
-test("subjects with no classes held do not force a false zero", () => {
+test("overall below the threshold reports critical", () => {
+  const data = dashboard([
+    subject({ id: "a", name: "A", attendedClasses: 60, heldClasses: 100 }),
+    subject({ id: "b", name: "B", attendedClasses: 70, heldClasses: 100 }),
+  ]);
+
+  assert.equal(data.overall.attendancePercent, 65);
+  assert.equal(data.overall.status, "critical");
+  assert.equal(data.overall.safeToMissClasses, 0);
+  assert.equal(data.overall.recoveryClassesNeeded, computeRecoveryClassesNeeded(130, 200, 75));
+});
+
+test("per-subject mode still works when the clause is enforced", () => {
+  // Guards the escape hatch: if NIET enforces section 1 again, flipping this
+  // one flag must restore weakest-subject behaviour.
+  const data = dashboard(
+    [
+      subject({ id: "maths", name: "Maths", attendedClasses: 68, heldClasses: 100 }),
+      subject({ id: "dsa", name: "DSA", attendedClasses: 87, heldClasses: 100 }),
+    ],
+    { policy: PER_SUBJECT_POLICY },
+  );
+
+  assert.equal(data.overall.status, "critical");
+  assert.equal(data.overall.safeToMissClasses, 0);
+  assert.equal(data.overall.weakestSubjectName, "Maths");
+});
+
+test("subjects with no classes held do not distort the verdict", () => {
   const data = dashboard([
     subject({ id: "started", name: "Started", attendedClasses: 90, heldClasses: 100 }),
     subject({ id: "fresh", name: "Fresh", attendedClasses: 0, heldClasses: 0 }),
   ]);
 
   assert.equal(data.overall.safeToMissClasses, 20);
-  assert.equal(data.overall.bindingSubjectName, "Started");
   assert.equal(data.subjects.find((s) => s.id === "fresh")?.status, "not-started");
 });
 
@@ -182,14 +217,49 @@ test("an empty subject list reports safe rather than crashing", () => {
   const data = dashboard([]);
   assert.equal(data.overall.status, "safe");
   assert.equal(data.overall.safeToMissClasses, 0);
-  assert.equal(data.overall.bindingSubjectName, undefined);
+  assert.equal(data.overall.weakestSubjectName, undefined);
 });
 
 /* ---------------------------- safe leave days ---------------------------- */
 
-test("a day is only safe if every subject that meets can absorb its own hit", () => {
-  // Maths has exactly 1 class of headroom but meets TWICE on the same day,
-  // so that day cannot be taken off even though the pooled budget looks fine.
+test("leave days draw on one shared pool in overall mode", () => {
+  // 166/200 = 83%; pooled allowance covers several days regardless of which
+  // subject each class belongs to.
+  const subjects = [
+    subject({ id: "maths", name: "Maths", attendedClasses: 76, heldClasses: 100 }),
+    subject({ id: "dsa", name: "DSA", attendedClasses: 90, heldClasses: 100 }),
+  ];
+
+  const calendarSessions = [
+    session("s1", "maths", "2099-01-05", "09:00"),
+    session("s2", "maths", "2099-01-05", "11:00"),
+    session("s3", "dsa", "2099-01-05", "14:00"),
+  ];
+
+  const data = dashboard(subjects, { calendarSessions });
+
+  assert.equal(data.overall.safeToMissClasses, computeBunkableClasses(166, 200, 75));
+  assert.equal(data.overall.safeLeaveDays, 1, "3 classes fit inside the pooled budget");
+});
+
+test("a day is refused once the shared pool runs out", () => {
+  // 150/200 = exactly 75%: no headroom at all.
+  const subjects = [
+    subject({ id: "maths", name: "Maths", attendedClasses: 75, heldClasses: 100 }),
+    subject({ id: "dsa", name: "DSA", attendedClasses: 75, heldClasses: 100 }),
+  ];
+
+  const data = dashboard(subjects, {
+    calendarSessions: [session("s1", "maths", "2099-01-05", "09:00")],
+  });
+
+  assert.equal(data.overall.safeToMissClasses, 0);
+  assert.equal(data.overall.safeLeaveDays, 0);
+});
+
+test("per-subject mode gives each subject its own leave budget", () => {
+  // Maths has exactly 1 class of headroom but meets twice that day, so the day
+  // is unsafe even though a pooled budget would allow it.
   const subjects = [
     subject({ id: "maths", name: "Maths", attendedClasses: 76, heldClasses: 100 }),
     subject({ id: "dsa", name: "DSA", attendedClasses: 95, heldClasses: 100 }),
@@ -203,23 +273,8 @@ test("a day is only safe if every subject that meets can absorb its own hit", ()
 
   assert.equal(computeBunkableClasses(76, 100, 75), 1);
 
-  const data = dashboard(subjects, { calendarSessions });
+  const data = dashboard(subjects, { calendarSessions, policy: PER_SUBJECT_POLICY });
   assert.equal(data.overall.safeLeaveDays, 0, "two Maths classes exceed its budget of 1");
-});
-
-test("a day is safe when every subject stays within its own budget", () => {
-  const subjects = [
-    subject({ id: "maths", name: "Maths", attendedClasses: 90, heldClasses: 100 }),
-    subject({ id: "dsa", name: "DSA", attendedClasses: 95, heldClasses: 100 }),
-  ];
-
-  const calendarSessions = [
-    session("s1", "maths", "2099-01-05", "09:00"),
-    session("s2", "dsa", "2099-01-05", "14:00"),
-  ];
-
-  const data = dashboard(subjects, { calendarSessions });
-  assert.equal(data.overall.safeLeaveDays, 1);
 });
 
 /* ------------------------------ simulation ------------------------------ */
@@ -246,7 +301,7 @@ test("missing classes raises held without raising attended", () => {
   assert.equal(result.projections[0].afterPercent, computeAttendancePercent(80, 102));
 });
 
-test("simulation status reflects the worst subject, not the average", () => {
+test("simulation status follows the overall figure", () => {
   const subjects = [
     subject({ id: "maths", name: "Maths", attendedClasses: 76, heldClasses: 100 }),
     subject({ id: "dsa", name: "DSA", attendedClasses: 99, heldClasses: 100 }),
@@ -263,10 +318,58 @@ test("simulation status reflects the worst subject, not the average", () => {
     request: { mode: "date-range", fromDate: "2099-04-06", toDate: "2099-04-06" },
   });
 
-  // 175/202 = 86.6% overall, but Maths lands at 76/102 = 74.5%.
+  // 175/202 = 86.63% overall, so this is safe even though Maths lands at 74.5%.
   assert.ok(result.overall.afterPercent > 75);
-  assert.equal(result.overall.status, "critical");
+  assert.equal(result.overall.status, "safe");
+  assert.equal(result.overall.weakestSubjectName, "Maths");
+  // Per-subject detail is still computed for the breakdown list.
   assert.equal(result.summary.thresholdBreaches, 1);
+});
+
+test("simulation reports critical once overall drops below the threshold", () => {
+  const result = simulateAttendance({
+    policy: POLICY,
+    subjects: [subject({ id: "maths", name: "Maths", attendedClasses: 76, heldClasses: 100 })],
+    timetable: [],
+    calendarSessions: [
+      session("s1", "maths", "2099-04-06", "09:00"),
+      session("s2", "maths", "2099-04-06", "10:00"),
+      session("s3", "maths", "2099-04-07", "09:00"),
+    ],
+    request: { mode: "date-range", fromDate: "2099-04-06", toDate: "2099-04-07" },
+  });
+
+  // 76/103 = 73.79%
+  assert.equal(result.overall.classesMissed, 3);
+  assert.ok(result.overall.afterPercent < 75);
+  assert.equal(result.overall.status, "critical");
+});
+
+test("missed classes are attributed to the subject that owns them", () => {
+  // Regression guard: when calendar sessions carry subject ids that do not
+  // match any subject, every absence collapsed onto whichever subject happened
+  // to match, and the rest silently vanished from the breakdown.
+  const subjects = [
+    subject({ id: "sem5:oops", name: "OOP with Java", attendedClasses: 30, heldClasses: 40 }),
+    subject({ id: "sem5:ai", name: "Artificial Intelligence", attendedClasses: 30, heldClasses: 40 }),
+  ];
+
+  const result = simulateAttendance({
+    policy: POLICY,
+    subjects,
+    timetable: [],
+    calendarSessions: [
+      session("s1", "sem5:oops", "2099-09-01", "09:00"),
+      session("s2", "sem5:ai", "2099-09-01", "10:00"),
+    ],
+    request: { mode: "date-range", fromDate: "2099-09-01", toDate: "2099-09-01" },
+  });
+
+  assert.equal(result.overall.classesMissed, 2);
+  assert.equal(result.projections.length, 2, "both subjects must appear");
+  for (const projection of result.projections) {
+    assert.equal(projection.classesMissed, 1, `${projection.subjectName} took exactly one`);
+  }
 });
 
 test("a window with no classes leaves attendance untouched", () => {

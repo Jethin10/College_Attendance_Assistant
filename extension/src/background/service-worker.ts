@@ -1,9 +1,8 @@
 /**
  * Background service worker — message router and action-badge owner.
  *
- * The badge shows the student's LOWEST subject percentage rather than their
- * aggregate, because NIET requires 75% in each subject individually and the
- * aggregate can look healthy while a subject is already failing.
+ * The badge shows overall attendance, matching what the institute enforces and
+ * what the ERP displays, so the two never disagree at a glance.
  */
 
 import {
@@ -66,9 +65,8 @@ async function updateBadge() {
       return;
     }
 
-    // Worst subject, not the average — that is the number that can detain you.
-    const percent =
-      dashboard.overall.bindingSubjectPercent ?? dashboard.overall.attendancePercent;
+    // Overall percentage — the figure the institute enforces and the ERP shows.
+    const percent = dashboard.overall.attendancePercent;
     const status = dashboard.overall.status;
 
     await chrome.action.setBadgeText({ text: `${Math.floor(percent)}` });

@@ -66,6 +66,7 @@ function renderVerdict(dashboard: DashboardData) {
   const { overall } = dashboard;
 
   meta.replaceChildren();
+  $("weak-note").classList.add("hidden");
 
   if (dashboard.subjects.length === 0) {
     verdict.dataset.state = "empty";
@@ -88,48 +89,64 @@ function renderVerdict(dashboard: DashboardData) {
   if (overall.status === "critical") {
     const need = overall.recoveryClassesNeeded;
     headline.textContent = "Below 75% — do not miss class";
-    detail.textContent =
-      overall.bindingSubjectName
-        ? `${overall.bindingSubjectName} is at ${overall.bindingSubjectPercent}%. Attend ${need} more ${plural(need, "class")} across your weak subjects to recover.`
-        : `Attend ${need} more ${plural(need, "class")} to recover.`;
+    detail.textContent = `You are at ${overall.attendancePercent}% overall. Attend ${need} more ${plural(need, "class")} in a row to get back above 75%.`;
   } else if (overall.safeToMissClasses === 0) {
     headline.textContent = "No margin left";
-    detail.textContent = overall.bindingSubjectName
-      ? `${overall.bindingSubjectName} is at ${overall.bindingSubjectPercent}%. The next missed class drops it below 75%.`
-      : "The next missed class drops you below 75%.";
+    detail.textContent = `You are at ${overall.attendancePercent}% overall. The next missed class drops you below 75%.`;
   } else {
     const count = overall.safeToMissClasses;
     headline.textContent = `Safe to miss ${count} ${plural(count, "class")}`;
-    detail.textContent = overall.bindingSubjectName
-      ? `Limited by ${overall.bindingSubjectName} at ${overall.bindingSubjectPercent}%.`
-      : "Based on your weakest subject.";
+    detail.textContent = `You are at ${overall.attendancePercent}% overall and would stay above 75%.`;
   }
 
-  const stats: Array<[string, string]> = [
-    ["Overall", `${overall.attendancePercent}%`],
-  ];
+  const stats: Array<[string, string]> = [];
 
   if (dashboard.calendarSessions.length > 0 && overall.safeLeaveDays > 0) {
-    stats.push([
-      "Full days off",
-      `${overall.safeLeaveDays}`,
-    ]);
+    stats.push(["Full days off", `${overall.safeLeaveDays}`]);
   }
 
   if (overall.status !== "critical" && overall.safeToMissClasses > 0) {
     stats.push(["Next miss costs", `${overall.nextMissDropPercent}%`]);
   }
 
-  const belowCount = dashboard.insights.belowThresholdCount;
-  if (belowCount > 0) {
-    stats.push([belowCount === 1 ? "Subject below 75%" : "Subjects below 75%", `${belowCount}`]);
-  }
+  stats.push(["Classes", `${overall.attendedClasses}/${overall.heldClasses}`]);
 
   for (const [label, value] of stats) {
     const item = el("span");
     item.append(`${label} `, el("strong", undefined, value));
     meta.append(item);
   }
+
+  // Advisory only. The institute enforces the overall figure, but a subject far
+  // below the line is worth knowing about — so it is mentioned without being
+  // dressed up as a verdict the student would act on.
+  renderWeakSubjectNote(dashboard);
+}
+
+function renderWeakSubjectNote(dashboard: DashboardData) {
+  const note = $("weak-note");
+  const below = dashboard.subjects.filter(
+    (subject) => subject.status !== "not-started" && subject.attendancePercent < 75,
+  );
+
+  if (below.length === 0 || dashboard.overall.status === "critical") {
+    note.classList.add("hidden");
+    return;
+  }
+
+  const weakest = [...below].sort((a, b) => a.attendancePercent - b.attendancePercent)[0];
+  note.classList.remove("hidden");
+  note.replaceChildren();
+
+  const label =
+    below.length === 1
+      ? `${weakest.name} is at ${weakest.attendancePercent}%`
+      : `${below.length} subjects are below 75%, lowest ${weakest.name} at ${weakest.attendancePercent}%`;
+
+  note.append(
+    el("span", "weak-note__label", label),
+    el("span", "weak-note__hint", "Your overall is fine — this is just worth watching."),
+  );
 }
 
 /* ------------------------------ Notice ------------------------------ */
@@ -196,13 +213,12 @@ function renderSubjects(dashboard: DashboardData) {
   );
 
   for (const subject of ordered) {
-    container.append(subjectRow(subject, dashboard.overall.bindingSubjectId));
+    container.append(subjectRow(subject));
   }
 }
 
-function subjectRow(subject: DashboardSubject, bindingId?: string) {
-  const isBinding = subject.id === bindingId;
-  const row = el("div", `subject subject--${subject.status}${isBinding ? " subject--binding" : ""}`);
+function subjectRow(subject: DashboardSubject) {
+  const row = el("div", `subject subject--${subject.status}`);
 
   const top = el("div", "subject__top");
   top.append(
@@ -219,21 +235,11 @@ function subjectRow(subject: DashboardSubject, bindingId?: string) {
   if (subject.status === "not-started") {
     meta.textContent = `${subject.code} · no classes held yet`;
   } else {
-    meta.append(`${subject.code} · ${subject.attendedClasses}/${subject.heldClasses} · `);
+    meta.append(`${subject.code} · ${subject.attendedClasses}/${subject.heldClasses}`);
 
     if (subject.status === "critical") {
       const need = subject.recoveryClassesNeeded;
-      meta.append(
-        el("span", "subject__flag", `attend ${need} to recover`),
-      );
-    } else if (subject.bunkableClasses === 0) {
-      meta.append(el("span", "subject__flag", "no margin left"));
-    } else {
-      meta.append(`${subject.bunkableClasses} to spare`);
-    }
-
-    if (isBinding && subject.status !== "critical") {
-      meta.append(" · your limit");
+      meta.append(" · ", el("span", "subject__flag", `${need} to reach 75%`));
     }
   }
 
@@ -248,7 +254,6 @@ function renderSimResult(result: SimulationResult) {
   wrap.classList.remove("hidden");
 
   const overall = result.overall;
-  const worst = [...result.projections].sort((a, b) => a.afterPercent - b.afterPercent)[0];
 
   $("sim-result-title").textContent = `${overall.beforePercent}% → ${overall.afterPercent}% overall`;
 
@@ -262,15 +267,9 @@ function renderSimResult(result: SimulationResult) {
   if (missed === 0) {
     body.textContent = "No classes fall in that window, so your attendance is unchanged.";
   } else if (overall.status === "critical") {
-    const breached = result.projections.filter((p) => p.afterPercent < 75);
-    const names = breached.map((p) => p.subjectName).join(", ");
-    body.textContent = names
-      ? `Missing ${missed} ${plural(missed, "class")} puts ${names} below 75%. That is enough to be detained from exams.`
-      : `Missing ${missed} ${plural(missed, "class")} puts you below 75%.`;
-  } else if (worst) {
-    body.textContent = `Missing ${missed} ${plural(missed, "class")} is survivable. Your weakest subject afterwards is ${worst.subjectName} at ${worst.afterPercent}%.`;
+    body.textContent = `Missing ${missed} ${plural(missed, "class")} drops you to ${overall.afterPercent}% overall, below the 75% you need. You would have to attend ${overall.recoveryClassesNeeded} in a row to recover.`;
   } else {
-    body.textContent = `Missing ${missed} ${plural(missed, "class")} keeps every subject above 75%.`;
+    body.textContent = `Missing ${missed} ${plural(missed, "class")} leaves you at ${overall.afterPercent}% overall, still above 75%.`;
   }
 
   const stats = $("sim-result-stats");

@@ -53,13 +53,23 @@ export interface TimetableSyncState {
 
 export interface AttendancePolicy {
   /**
-   * NIET requires 75% in each theory and practical subject individually
-   * (Attendance Policy 2025-26, section 1). This threshold is therefore
-   * applied per subject, not to the aggregate.
+   * Minimum attendance percentage. Applied to the OVERALL figure, which is
+   * what NIET currently enforces in practice.
    */
   thresholdPercent: number;
   /** Floor below which severe-medical condonation cannot be granted. */
   severeMedicalFloorPercent: number;
+  /**
+   * When true, the verdict is driven by the weakest subject rather than the
+   * overall figure.
+   *
+   * The signed Attendance Policy 2025-26 (section 1) requires 75% in each
+   * subject individually, but that clause is not being enforced — only the
+   * overall percentage is. The extension therefore reports on overall by
+   * default and keeps per-subject shortfalls as an advisory note, so students
+   * are not told they are unsafe when the institute considers them fine.
+   */
+  enforcePerSubject: boolean;
 }
 
 export interface ERPImportSnapshot {
@@ -138,10 +148,11 @@ export interface SimulationResult {
     /** True when the synced schedule ends before recovery is achievable. */
     recoveryBeyondSchedule: boolean;
     safeLeaveDaysRemaining: number;
-    /** Worst per-subject status after the simulated absence. */
+    /** Status of the overall percentage after the simulated absence. */
     status: RiskStatus;
-    /** Subject that breaches the threshold first, if any. */
-    bindingSubjectName?: string;
+    /** Weakest subject after the absence, as advisory context. */
+    weakestSubjectName?: string;
+    weakestSubjectPercent?: number;
   };
   summary: {
     impactedSubjects: number;
@@ -194,24 +205,23 @@ export interface DashboardData {
   overall: {
     attendedClasses: number;
     heldClasses: number;
-    /** Aggregate percentage. Shown for cross-checking against the ERP only. */
+    /** Aggregate percentage — the figure NIET enforces and the ERP displays. */
     attendancePercent: number;
     nextMissDropPercent: number;
-    /**
-     * Classes that can be missed while every subject stays at or above the
-     * threshold. This is the minimum across started subjects, NOT the figure
-     * derived from aggregate totals.
-     */
+    /** Classes that can be missed while overall stays at or above the threshold. */
     safeToMissClasses: number;
-    /** Subject with the least headroom; the constraint the student feels. */
-    bindingSubjectId?: string;
-    bindingSubjectName?: string;
-    bindingSubjectPercent?: number;
     safeLeaveDays: number;
-    /** Classes needed to bring every subject back to the threshold. */
+    /** Classes needed to bring overall back to the threshold. */
     recoveryClassesNeeded: number;
-    /** Worst status across started subjects. */
+    /** Status of the overall percentage. */
     status: RiskStatus;
+    /**
+     * Weakest subject, surfaced as advisory context rather than as the verdict.
+     * Present whenever at least one subject has started.
+     */
+    weakestSubjectId?: string;
+    weakestSubjectName?: string;
+    weakestSubjectPercent?: number;
   };
   subjects: DashboardSubject[];
   timetable: ScheduleSlot[];

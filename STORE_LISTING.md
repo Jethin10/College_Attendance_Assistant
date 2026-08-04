@@ -11,7 +11,7 @@ NIET Attendance Planner
 ## Short description (132 char max)
 
 ```
-Know if you can safely miss a class. Tracks NIET's 75% requirement for every subject individually, not just your average.
+Know if you can safely miss a class. Reads your NIET ERP attendance and shows exactly how much margin you have left.
 ```
 
 ## Category
@@ -24,15 +24,15 @@ Productivity
 NIET Attendance Planner reads your attendance from the NIET ERP and answers one
 question: can you afford to miss a class right now?
 
-WHY THIS DIFFERS FROM THE ERP'S NUMBER
+WHAT IT TELLS YOU
 
-The ERP shows your overall attendance. NIET's policy is stricter — it requires
-75% in each theory and practical subject individually (Attendance Policy
-2025-26, section 1). You can be at 82% overall and still be detained because a
-single subject sits at 71%.
+Your overall attendance is the figure the institute enforces, so that is what
+the verdict is based on — it will always agree with your ERP. On top of that it
+tells you how many classes you can still miss, how many full days off that is
+worth, and what a planned absence would cost you.
 
-This extension leads with your weakest subject and tells you which one is
-holding you back.
+Subjects that have fallen below 75% are flagged as a note, so you know about
+them without being told you are unsafe when your overall is fine.
 
 WHAT IT DOES
 
@@ -66,7 +66,7 @@ This is a student-built tool.
 
 ```
 Helps a NIET student understand their own class attendance and plan leave
-without dropping below the institute's 75%-per-subject requirement.
+without dropping below the institute's 75% attendance requirement.
 ```
 
 **Permission justifications**
@@ -108,8 +108,8 @@ https://github.com/Jethin10/College_Attendance_Assistant/blob/main/PRIVACY.md
 number, or figures — screenshots are public and permanent.**
 
 Worth capturing:
-1. Popup with a healthy verdict, weakest subject named
-2. Popup with a critical verdict showing recovery guidance
+1. Popup with a healthy verdict and remaining margin
+2. Popup with a below-75% verdict showing recovery guidance
 3. Leave planner with a result breakdown
 4. The on-page summary bar above the ERP attendance table
 
