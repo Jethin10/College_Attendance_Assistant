@@ -85,6 +85,8 @@
       function simulate(request) {
         const missed = new Map();
         const assumed = new Map();
+        let scheduleEstimated = false;
+        let scheduleSourceDates = [];
         if (request.mode === "future-count") {
           missed.set(request.subjectId, Math.max(1, Math.floor(request.futureClasses || 1)));
         } else {
@@ -92,13 +94,32 @@
           const startDate = request.fromDate || "2026-08-06";
           const endDate = addDays(startDate, days - 1);
           const scheduled = calendarSessions.filter((session) => session.date <= endDate);
-          const daySessions = scheduled.filter((session) => {
+          let daySessions = scheduled.filter((session) => {
             const onLeave = session.date >= startDate && session.date <= endDate;
             if (!onLeave) return false;
             if (request.dayPart === "morning") return session.startTime < "12:00";
             if (request.dayPart === "afternoon") return session.startTime >= "12:00";
             return true;
           });
+          if (daySessions.length === 0) {
+            const target = new Date(`${startDate}T00:00:00`);
+            const templateDates = [...new Set(calendarSessions
+              .filter((session) => session.dayOfWeek === target.getDay() && session.date < startDate)
+              .map((session) => session.date))].sort().reverse();
+            const templateDate = templateDates[0];
+            if (templateDate) {
+              scheduleEstimated = true;
+              scheduleSourceDates = [templateDate];
+              daySessions = calendarSessions
+                .filter((session) => session.date === templateDate)
+                .map((session) => ({ ...session, id: `estimated-${session.id}`, date: startDate }))
+                .filter((session) => {
+                  if (request.dayPart === "morning") return session.startTime < "12:00";
+                  if (request.dayPart === "afternoon") return session.startTime >= "12:00";
+                  return true;
+                });
+            }
+          }
           const missedIds = new Set(daySessions.map((session) => session.id));
           for (const session of daySessions) {
             missed.set(session.subjectId, (missed.get(session.subjectId) || 0) + 1);
@@ -158,6 +179,8 @@
             thresholdBreaches: projections.filter((item) => item.afterPercent < threshold).length,
             subjectsBelowThreshold: below.length,
             newThresholdBreaches: newlyBelow.length,
+            scheduleEstimated,
+            scheduleSourceDates,
           },
         };
       }

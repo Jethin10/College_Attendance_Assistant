@@ -358,6 +358,14 @@
   line-height: 1.2;
 }
 
+.niet-leave-planner__after[data-percent-state="safe"] {
+  color: #167447;
+}
+
+.niet-leave-planner__after[data-percent-state="critical"] {
+  color: #a3433d;
+}
+
 .niet-leave-planner__delta {
   flex: 0 0 auto;
   margin-top: 0 !important;
@@ -393,7 +401,6 @@
   color: #8a641f;
 }
 
-.niet-leave-planner__result[data-state="critical"] .niet-leave-planner__after,
 .niet-leave-planner__result[data-state="critical"] .niet-leave-planner__result-foot {
   color: #a3433d;
 }
@@ -425,25 +432,40 @@
 }
 
 .niet-attendance-note {
-  display: inline;
-  margin-left: 8px;
+  display: inline-block;
+  width: 66px;
+  margin-left: 9px;
   padding: 0;
   border: 0;
   background: transparent;
   font-size: 11px;
-  font-weight: 400;
+  font-weight: 500;
   line-height: inherit;
+  text-align: left;
   white-space: nowrap;
   vertical-align: baseline;
 }
 
-.niet-attendance-note--safe,
+/* Percentages align like numeric table data; the fixed status width makes
+   every label begin at the same point without changing the portal's columns. */
+td:has(> .niet-attendance-note) {
+  text-align: right !important;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.niet-attendance-note--safe {
+  color: #397158;
+}
+
 .niet-attendance-note--neutral {
-  color: #616c76;
+  color: #68727c;
+  font-weight: 400;
 }
 
 .niet-attendance-note--critical {
-  color: #8e4541;
+  color: #b42318;
+  font-weight: 600;
 }
 
 .niet-leave-planner button:focus-visible,

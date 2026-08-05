@@ -8,10 +8,20 @@
  * Nothing leaves the browser. Every request here targets the ERP itself.
  */
 
+import {
+  buildCoherentWeeklyTimetable,
+  dedupeCalendarSessions,
+  extractPortalTimetableRows,
+  normalizePortalTime,
+} from "@/lib/portal-timetable";
+import { extractPortalStudentContext } from "@/lib/portal-student";
+import { isExtensionContextInvalidated } from "@/lib/extension-context";
+
 const OVERLAY_ATTR = "data-niet-planner";
 const THRESHOLD = 75;
 const RESCAN_DEBOUNCE_MS = 500;
 const TIMETABLE_RANGE_DAYS = 45;
+const TIMETABLE_HISTORY_DAYS = 14;
 const TIMETABLE_REFRESH_MS = 5 * 60 * 1000;
 
 type ScheduleSlot = {
@@ -40,6 +50,7 @@ type CalendarSession = {
 type StudentContext = {
   studentName?: string;
   semesterLabel?: string;
+  academicYear?: string;
   branch?: string;
   section?: string;
   rollNo?: string;
@@ -108,6 +119,8 @@ type PlannerSimulationResult = {
     thresholdBreaches: number;
     subjectsBelowThreshold: number;
     newThresholdBreaches: number;
+    scheduleEstimated: boolean;
+    scheduleSourceDates: string[];
   };
 };
 
@@ -124,6 +137,7 @@ type PortalTimetableRow = {
   employeeName1?: string;
   roomNo?: string;
   roomName?: string;
+  timetable?: PortalTimetableRow[];
 };
 
 /** Thrown when the portal answers with the login page instead of data. */
@@ -141,8 +155,31 @@ let rescanTimer: number | null = null;
 let currentUrl = location.href;
 let overlayEnabled = true;
 let observer: MutationObserver | null = null;
+let contentScriptStopped = false;
 /** Set while we mutate the DOM ourselves, so the observer ignores our writes. */
 let injecting = false;
+
+const handleHistoryChange = () => scheduleSync(true);
+
+/**
+ * Reloading an unpacked extension invalidates scripts already living in tabs.
+ * Disconnect quietly; Chrome injects the new script after the page refreshes.
+ */
+function stopInvalidatedContentScript() {
+  if (contentScriptStopped) {
+    return;
+  }
+
+  contentScriptStopped = true;
+  if (rescanTimer !== null) {
+    window.clearTimeout(rescanTimer);
+    rescanTimer = null;
+  }
+  observer?.disconnect();
+  observer = null;
+  window.removeEventListener("popstate", handleHistoryChange);
+  window.removeEventListener("hashchange", handleHistoryChange);
+}
 
 function round(value: number, digits = 2) {
   return Number(value.toFixed(digits));
@@ -548,20 +585,6 @@ function parsePortalDate(dateText?: string) {
 function normalizePortalDate(dateText?: string) {
   const date = parsePortalDate(dateText);
   return date ? toDateKey(date) : null;
-}
-
-function normalizeTime(raw?: string) {
-  const value = raw?.trim();
-  if (!value) {
-    return null;
-  }
-
-  const match = value.match(/^(\d{1,2}):(\d{2})/);
-  if (!match) {
-    return null;
-  }
-
-  return `${match[1].padStart(2, "0")}:${match[2]}`;
 }
 
 function subjectSignature() {
@@ -1008,6 +1031,11 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
     const afterPercent = subjectProjection?.afterPercent ?? overall.afterPercent;
     const deltaPercent = subjectProjection?.deltaPercent ?? overall.deltaPercent;
     const status = subjectProjection?.status ?? overall.status;
+    const estimateText = summary.scheduleEstimated
+      ? summary.scheduleSourceDates[0]
+        ? `Estimated from ${formatPlannerDate(summary.scheduleSourceDates[0])} timetable`
+        : "Estimated from the recent weekly timetable"
+      : "";
 
     resultBefore.hidden = false;
     resultArrow.hidden = false;
@@ -1019,6 +1047,7 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
       : "Projected overall attendance";
     resultBefore.textContent = `${beforePercent}%`;
     resultAfter.textContent = `${afterPercent}%`;
+    resultAfter.dataset.percentState = afterPercent >= THRESHOLD ? "safe" : "critical";
     resultDelta.textContent = deltaPercent > 0
       ? `${deltaPercent} ${plural(deltaPercent, "point", "points")} lower`
       : deltaPercent < 0
@@ -1036,6 +1065,9 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
 
     if (classMode && subjectProjection) {
       resultDetail.textContent = `${summary.classesMissed} ${plural(summary.classesMissed, "class", "classes")} missed · overall ${overall.beforePercent}% → ${overall.afterPercent}%`;
+      if (estimateText) {
+        resultDetail.textContent += ` · ${estimateText}`;
+      }
       if (subjectProjection.afterPercent < THRESHOLD) {
         const crossing = subjectProjection.beforePercent >= THRESHOLD ? "Falls" : "Remains";
         resultFoot.textContent = `${crossing} below the 75% target · ${subjectProjection.recoveryClassesNeeded} ${plural(subjectProjection.recoveryClassesNeeded, "class", "classes")} to return`;
@@ -1048,6 +1080,9 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
     resultDetail.textContent = `${summary.classesMissed} ${plural(summary.classesMissed, "class", "classes")} missed across ${summary.impactedSubjects} ${plural(summary.impactedSubjects, "subject", "subjects")}`;
     if (summary.classesAssumedAttended > 0) {
       resultDetail.textContent += ` · ${summary.classesAssumedAttended} earlier ${plural(summary.classesAssumedAttended, "class", "classes")} assumed attended`;
+    }
+    if (estimateText) {
+      resultDetail.textContent += ` · ${estimateText}`;
     }
     if (summary.subjectsBelowThreshold > 0) {
       resultFoot.textContent = summary.newThresholdBreaches > 0
@@ -1067,6 +1102,7 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
     resultLabel.textContent = "Could not check this leave";
     resultBefore.textContent = `${dashboard!.overall.attendancePercent}%`;
     resultAfter.textContent = "—";
+    delete resultAfter.dataset.percentState;
     resultDelta.textContent = "Not calculated";
     resultDetail.textContent = message;
     resultFoot.textContent = "Try refreshing the attendance page";
@@ -1081,6 +1117,7 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
     resultMeta.hidden = true;
     resultBefore.textContent = `${dashboard!.overall.attendancePercent}%`;
     resultAfter.textContent = `${dashboard!.overall.attendancePercent}%`;
+    delete resultAfter.dataset.percentState;
     resultDelta.textContent = "No change";
     resultDetail.textContent = "";
     resultFoot.textContent = `${dashboard!.overall.attendedClasses} of ${dashboard!.overall.heldClasses} classes attended`;
@@ -1119,6 +1156,22 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
         };
 
     try {
+      // Refresh the chosen date immediately before calculating. The broad
+      // background sync may predate a newly published schedule, and dates
+      // outside its normal horizon still deserve an exact lookup.
+      if (!classMode) {
+        try {
+          await fetchPortalTimetable(true, dateInput.value);
+        } catch (error) {
+          if (isExtensionContextInvalidated(error)) {
+            stopInvalidatedContentScript();
+            throw error;
+          }
+          await reportSyncProblem(error);
+          // Stored dated rows or the coherent weekday fallback remain usable.
+        }
+      }
+
       const response = await chrome.runtime.sendMessage({
         type: "PREVIEW_SIMULATION",
         payload,
@@ -1296,8 +1349,8 @@ function buildCalendarSessions(rows: PortalTimetableRow[]) {
 
   rows.forEach((row, index) => {
     const dateKey = normalizePortalDate(row.lectureDate);
-    const startTime = normalizeTime(row.startTimeHM ?? row.lStartTime);
-    const endTime = normalizeTime(row.endTimeHM ?? row.lEndTime);
+    const startTime = normalizePortalTime(row.startTimeHM ?? row.lStartTime);
+    const endTime = normalizePortalTime(row.endTimeHM ?? row.lEndTime);
     const code = deriveSubjectCode(row);
 
     if (!dateKey || !startTime || !endTime || !code) {
@@ -1332,32 +1385,7 @@ function buildCalendarSessions(rows: PortalTimetableRow[]) {
 }
 
 function buildWeeklyTimetable(calendarSessions: CalendarSession[]): ScheduleSlot[] {
-  const unique = new Map<string, ScheduleSlot>();
-
-  calendarSessions.forEach((session) => {
-    const key = [
-      session.subjectId,
-      session.dayOfWeek,
-      session.startTime,
-      session.endTime,
-      session.room ?? "",
-    ].join("|");
-
-    if (!unique.has(key)) {
-      unique.set(key, {
-        id: `slot:${session.subjectId}:${session.dayOfWeek}:${session.startTime}:${session.endTime}`,
-        subjectId: session.subjectId,
-        dayOfWeek: session.dayOfWeek,
-        startTime: session.startTime,
-        endTime: session.endTime,
-        room: session.room,
-      });
-    }
-  });
-
-  return [...unique.values()].sort(
-    (a, b) => a.dayOfWeek - b.dayOfWeek || a.startTime.localeCompare(b.startTime),
-  );
+  return buildCoherentWeeklyTimetable(calendarSessions);
 }
 
 /**
@@ -1426,17 +1454,7 @@ async function fetchAcademicInfo(): Promise<StudentContext> {
       return {};
     }
 
-    const clean = (value?: string) => {
-      const trimmed = value?.trim();
-      return trimmed && trimmed !== "null" ? trimmed : undefined;
-    };
-
-    return {
-      branch: clean(info.courseName),
-      section: clean(info.divisionName),
-      semesterLabel: clean(info.semesterName),
-      rollNo: clean(info.rollNo),
-    };
+    return extractPortalStudentContext(info);
   } catch (error) {
     if (error instanceof SessionExpiredError) {
       throw error;
@@ -1460,24 +1478,33 @@ async function resolveStudentContext(): Promise<StudentContext> {
   };
 }
 
-async function fetchPortalTimetable(force = false) {
+async function fetchPortalTimetable(force = false, focusDateKey?: string) {
   const now = Date.now();
   if (!force && now - lastTimetableFetchAt < TIMETABLE_REFRESH_MS) {
     return { imported: false, count: 0, skipped: true };
   }
 
-  const start = new Date();
-  start.setHours(0, 0, 0, 0);
-  const end = new Date(start);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const start = new Date(today);
+  start.setDate(start.getDate() - TIMETABLE_HISTORY_DAYS);
+  const end = new Date(today);
   end.setDate(end.getDate() + TIMETABLE_RANGE_DAYS);
 
   const rangeStart = toDateKey(start);
   const rangeEnd = toDateKey(end);
 
-  const [todayPayload, betweenPayload] = await Promise.all([
+  const focusDate = focusDateKey && /^\d{4}-\d{2}-\d{2}$/.test(focusDateKey)
+    ? (() => {
+        const [year, month, day] = focusDateKey.split("-").map(Number);
+        return new Date(year, month - 1, day);
+      })()
+    : undefined;
+
+  const [todayPayload, betweenPayload, focusPayload] = await Promise.all([
     fetchPortalJson(
       `/stu_getTodaysScheduleForStudentLoggedIn.json?date=${encodeURIComponent(
-        formatPortalDate(start),
+        formatPortalDate(today),
       )}`,
     ).catch((error) => {
       if (error instanceof SessionExpiredError) {
@@ -1490,10 +1517,31 @@ async function fetchPortalTimetable(force = false) {
         formatPortalDate(start),
       )}&endDate=${encodeURIComponent(formatPortalDate(end))}`,
     ),
+    focusDate
+      ? fetchPortalJson(
+          `/getBetweenDatesTimetableForStudent.json?startDate=${encodeURIComponent(
+            formatPortalDate(focusDate),
+          )}&endDate=${encodeURIComponent(formatPortalDate(focusDate))}`,
+        ).catch((error) => {
+          if (error instanceof SessionExpiredError) {
+            throw error;
+          }
+          return [];
+        })
+      : Promise.resolve([]),
   ]);
 
-  const rows = Array.isArray(betweenPayload) ? (betweenPayload as PortalTimetableRow[]) : [];
-  const calendarSessions = buildCalendarSessions(rows);
+  const rowsFrom = (payload: unknown, fallbackDate?: Date) =>
+    extractPortalTimetableRows<PortalTimetableRow>(
+      payload,
+      fallbackDate ? formatPortalDate(fallbackDate) : undefined,
+    );
+  const rows = [
+    ...rowsFrom(betweenPayload),
+    ...rowsFrom(todayPayload, today),
+    ...rowsFrom(focusPayload, focusDate),
+  ];
+  const calendarSessions = dedupeCalendarSessions(buildCalendarSessions(rows));
   const timetable = buildWeeklyTimetable(calendarSessions);
 
   const holidayMessage =
@@ -1538,6 +1586,11 @@ async function fetchPortalTimetable(force = false) {
 }
 
 async function reportSyncProblem(error: unknown) {
+  if (contentScriptStopped || isExtensionContextInvalidated(error)) {
+    stopInvalidatedContentScript();
+    return;
+  }
+
   const expired = error instanceof SessionExpiredError;
 
   await chrome.runtime
@@ -1555,6 +1608,10 @@ async function reportSyncProblem(error: unknown) {
 }
 
 async function syncPortalData(force = false) {
+  if (contentScriptStopped) {
+    return { found: false, imported: false, timetableImported: false };
+  }
+
   let student: StudentContext = {};
   let timetableImported = false;
 
@@ -1570,6 +1627,10 @@ async function syncPortalData(force = false) {
     const timetableResult = await fetchPortalTimetable(force);
     timetableImported = timetableResult.imported;
   } catch (error) {
+    if (isExtensionContextInvalidated(error)) {
+      stopInvalidatedContentScript();
+      return { found: false, imported: false, timetableImported: false };
+    }
     await reportSyncProblem(error);
   }
 
@@ -1601,12 +1662,25 @@ async function syncPortalData(force = false) {
 }
 
 function scheduleSync(force = false) {
+  if (contentScriptStopped) {
+    return;
+  }
+
   if (rescanTimer !== null) {
     window.clearTimeout(rescanTimer);
   }
 
   rescanTimer = window.setTimeout(() => {
+    rescanTimer = null;
+    if (contentScriptStopped) {
+      return;
+    }
+
     syncPortalData(force).catch((error) => {
+      if (isExtensionContextInvalidated(error)) {
+        stopInvalidatedContentScript();
+        return;
+      }
       console.warn("[NIET Planner] Sync failed:", error);
     });
   }, RESCAN_DEBOUNCE_MS);
@@ -1633,6 +1707,10 @@ function isSelfInflicted(mutations: MutationRecord[]) {
 }
 
 function monitorPageChanges() {
+  if (contentScriptStopped || observer !== null) {
+    return;
+  }
+
   observer = new MutationObserver((mutations) => {
     if (injecting || isSelfInflicted(mutations)) {
       return;
@@ -1654,8 +1732,8 @@ function monitorPageChanges() {
     subtree: true,
   });
 
-  window.addEventListener("popstate", () => scheduleSync(true));
-  window.addEventListener("hashchange", () => scheduleSync(true));
+  window.addEventListener("popstate", handleHistoryChange);
+  window.addEventListener("hashchange", handleHistoryChange);
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -1703,14 +1781,27 @@ async function init() {
     if (response?.success) {
       overlayEnabled = response.preferences?.showPageOverlay ?? true;
     }
-  } catch {
+  } catch (error) {
+    if (isExtensionContextInvalidated(error)) {
+      stopInvalidatedContentScript();
+      return;
+    }
     // Preferences are best-effort; default to showing the overlay.
   }
 
-  syncPortalData(true).catch((error) => {
+  try {
+    await syncPortalData(true);
+  } catch (error) {
+    if (isExtensionContextInvalidated(error)) {
+      stopInvalidatedContentScript();
+      return;
+    }
     console.warn("[NIET Planner] Initial sync failed:", error);
-  });
-  monitorPageChanges();
+  }
+
+  if (!contentScriptStopped) {
+    monitorPageChanges();
+  }
 }
 
 if (document.readyState === "loading") {

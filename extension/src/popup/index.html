@@ -3,173 +3,37 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Attendance Planner</title>
+  <title>NIET Attendance Planner</title>
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
-  <div id="app">
-    <header class="header">
-      <div class="header__bar">
-        <div class="header__identity">
-          <h1 class="header__title">Attendance</h1>
-          <p id="student-context" class="header__subtitle">NIET Greater Noida</p>
-        </div>
-        <button id="btn-refresh" class="icon-button" type="button" title="Refresh from portal" aria-label="Refresh from portal">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M20 11a8 8 0 1 0-2.3 5.7" />
-            <path d="M20 4v7h-7" />
-          </svg>
-        </button>
-      </div>
-
-      <!-- Advisory verdict against the published per-subject planning target -->
-      <div id="verdict" class="verdict" data-state="loading">
-        <p id="verdict-headline" class="verdict__headline">Checking your attendance…</p>
-        <p id="verdict-detail" class="verdict__detail"></p>
-        <div id="verdict-meta" class="verdict__meta"></div>
-      </div>
-
-      <!-- Advisory: a subject well below 75%, shown without overstating it -->
-      <div id="weak-note" class="weak-note hidden"></div>
-
-      <div id="notice" class="notice hidden">
-        <span id="notice-text" class="notice__text"></span>
-        <button id="notice-action" class="notice__action hidden" type="button"></button>
-      </div>
+  <main class="profile-card">
+    <header class="profile-card__header">
+      <p class="profile-card__eyebrow">NIET Attendance Planner</p>
+      <h1>Jethin Kosaraju</h1>
+      <p class="profile-card__role">B.Tech &middot; Computer Science &amp; Engineering</p>
     </header>
 
-    <nav class="tabs" role="tablist">
-      <button class="tab is-active" data-tab="subjects" role="tab" aria-selected="true">Subjects</button>
-      <button class="tab" data-tab="simulator" role="tab" aria-selected="false">Plan leave</button>
-      <button class="tab" data-tab="settings" role="tab" aria-selected="false">Settings</button>
+    <p class="profile-card__note">
+      Built by a NIET student for simpler attendance and leave planning. Found an issue or have a suggestion? Feel free to reach out.
+    </p>
+
+    <nav class="profile-links" aria-label="Jethin Kosaraju profiles">
+      <a href="https://in.linkedin.com/in/jethin-kosaraju" data-profile-link>
+        <span>LinkedIn</span>
+        <small>View profile</small>
+      </a>
+      <a href="https://github.com/Jethin10" data-profile-link>
+        <span>GitHub</span>
+        <small>View projects</small>
+      </a>
     </nav>
 
-    <main class="content">
-      <section id="tab-subjects" class="panel is-active" role="tabpanel">
-        <div id="subjects-list" class="subject-list">
-          <div class="skeleton-row"></div>
-          <div class="skeleton-row"></div>
-          <div class="skeleton-row"></div>
-        </div>
-      </section>
-
-      <section id="tab-simulator" class="panel" role="tabpanel">
-        <div class="section">
-          <h2 class="section__title">Plan leave</h2>
-          <p class="section__hint">See the effect on every subject before you decide.</p>
-
-          <div class="field">
-            <label class="field__label" for="sim-mode">What are you planning?</label>
-            <select id="sim-mode" class="field__control">
-              <option value="leave-days">Take full days off</option>
-              <option value="date-range">A date range</option>
-              <option value="future-count">A number of classes</option>
-            </select>
-          </div>
-
-          <div id="sim-leave-fields" class="field-row">
-            <div class="field">
-              <label class="field__label" for="sim-leave-days">Days</label>
-              <input type="number" id="sim-leave-days" class="field__control" min="1" max="60" value="1" />
-            </div>
-            <div class="field">
-              <label class="field__label" for="sim-from-date">Starting</label>
-              <input type="date" id="sim-from-date" class="field__control" />
-            </div>
-          </div>
-
-          <div id="sim-range-fields" class="field-row hidden">
-            <div class="field">
-              <label class="field__label" for="sim-range-from">From</label>
-              <input type="date" id="sim-range-from" class="field__control" />
-            </div>
-            <div class="field">
-              <label class="field__label" for="sim-range-to">To</label>
-              <input type="date" id="sim-range-to" class="field__control" />
-            </div>
-          </div>
-
-          <div id="sim-future-fields" class="field-row hidden">
-            <div class="field">
-              <label class="field__label" for="sim-future-count">Classes to miss</label>
-              <input type="number" id="sim-future-count" class="field__control" min="1" max="100" value="1" />
-            </div>
-          </div>
-
-          <button id="btn-simulate" class="button button--primary" type="button">Check impact</button>
-          <p id="sim-error" class="field__error hidden"></p>
-        </div>
-
-        <div id="sim-result" class="section hidden">
-          <div class="result__head">
-            <h3 id="sim-result-title" class="result__title"></h3>
-            <span id="sim-result-status" class="pill"></span>
-          </div>
-          <p id="sim-result-body" class="result__body"></p>
-          <dl id="sim-result-stats" class="result__stats"></dl>
-
-          <div id="sim-impact-summary" class="result__block hidden">
-            <h4 class="result__block-title">Per subject</h4>
-            <div id="sim-impact-list" class="impact-list"></div>
-          </div>
-
-          <div id="sim-class-list-wrap" class="result__block hidden">
-            <h4 class="result__block-title">Classes you would miss</h4>
-            <div id="sim-class-list" class="class-list"></div>
-          </div>
-        </div>
-      </section>
-
-      <section id="tab-settings" class="panel" role="tabpanel">
-        <div class="section">
-          <h2 class="section__title">On-page summary</h2>
-          <p class="section__hint">Show a summary bar above the attendance table on the ERP.</p>
-          <label class="toggle">
-            <input type="checkbox" id="toggle-overlay" checked />
-            <span class="toggle__label">Show summary on ERP pages</span>
-          </label>
-        </div>
-
-        <div class="section">
-          <h2 class="section__title">Paste attendance</h2>
-          <p class="section__hint">Only needed if automatic reading fails. Copy the attendance table and paste it here.</p>
-          <textarea id="paste-data" class="field__control field__control--area" rows="4" placeholder="CS301&#9;Data Structures&#9;14&#9;22&#9;63.64"></textarea>
-          <button id="btn-import-paste" class="button button--secondary" type="button">Import</button>
-          <p id="paste-result" class="field__note"></p>
-        </div>
-
-        <div class="section">
-          <h2 class="section__title">How this works</h2>
-          <ul class="info-list">
-            <li>
-              <strong>Checks every subject.</strong>
-              NIET's current published policy sets a 75% target in each theory and practical subject.
-            </li>
-            <li>
-              <strong>Also shows your overall figure.</strong>
-              It is calculated from the same present and total counts shown by the ERP, so you can cross-check the projection.
-            </li>
-            <li>
-              <strong>Reads your own portal session.</strong>
-              Attendance and your dated timetable are read from the ERP while you are signed in. No passwords are stored.
-            </li>
-            <li>
-              <strong>Stays on this device.</strong>
-              Everything is kept in local browser storage. Nothing is uploaded, and there is no analytics.
-            </li>
-            <li>
-              <strong>Estimates, not a guarantee.</strong>
-              Being below 75% does not let this extension decide exam eligibility. Always confirm with NIET and the ERP; approved OD, condonation, and exceptions are not counted.
-            </li>
-          </ul>
-        </div>
-
-        <p class="footer-note">
-          <span id="version-label">Attendance Planner</span> · Unofficial student tool
-        </p>
-      </section>
-    </main>
-  </div>
+    <footer>
+      <span>Unofficial student project</span>
+      <span id="version-label"></span>
+    </footer>
+  </main>
 
   <script type="module" src="popup.js"></script>
 </body>
