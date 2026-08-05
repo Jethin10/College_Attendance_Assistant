@@ -1,15 +1,9 @@
 /**
  * Attendance engine.
  *
- * The verdict is driven by OVERALL attendance, which is what NIET enforces in
- * practice and what the ERP displays.
- *
- * The signed Attendance Policy 2025-26 (section 1) also requires 75% in each
- * theory and practical subject individually, but that clause is not currently
- * enforced. Reporting on it as the verdict would tell students they are unsafe
- * when the institute considers them fine, so per-subject shortfalls are kept as
- * an advisory note instead. `policy.enforcePerSubject` flips the verdict back
- * to the weakest subject if that ever changes.
+ * NIET's published Attendance Policy 2025-26 sets a 75% per-subject standard.
+ * The engine uses it as a planning target, not as a claim about exam eligibility,
+ * condonation, or exceptions. Aggregate percentage remains an ERP cross-check.
  */
 
 import {
@@ -66,6 +60,18 @@ function parseTimeMinutes(time: string) {
   return hours * 60 + minutes;
 }
 
+function matchesLeaveDayPart(
+  startTime: string,
+  dayPart: SimulationRequest["dayPart"],
+) {
+  if (!dayPart || dayPart === "full") {
+    return true;
+  }
+
+  const startsInMorning = parseTimeMinutes(startTime) < 12 * 60;
+  return dayPart === "morning" ? startsInMorning : !startsInMorning;
+}
+
 function sessionStartDate(session: CalendarSession) {
   const date = parseDateKey(session.date);
   const [hours, minutes] = session.startTime.split(":").map(Number);
@@ -96,6 +102,45 @@ function makeSessionFromSlot(slot: ScheduleSlot, date: Date): CalendarSession {
     room: slot.room,
     source: "manual",
   };
+}
+
+function makeSimulatedFutureSession(
+  subjectId: string,
+  index: number,
+  startDate = new Date(),
+): CalendarSession {
+  const date = startOfDay(startDate);
+  date.setDate(date.getDate() + index);
+
+  return {
+    id: `simulated-future:${subjectId}:${index}:${toDateKey(date)}`,
+    subjectId,
+    subjectCode: subjectId,
+    subjectName: subjectId,
+    date: toDateKey(date),
+    dayOfWeek: date.getDay(),
+    startTime: "00:00",
+    endTime: "00:00",
+    source: "manual",
+  };
+}
+
+function fillRequestedFutureCount(
+  sessions: CalendarSession[],
+  wanted: number,
+  subjectId?: string,
+) {
+  if (!subjectId || sessions.length >= wanted) {
+    return sessions.slice(0, wanted);
+  }
+
+  const missing = wanted - sessions.length;
+  return [
+    ...sessions,
+    ...Array.from({ length: missing }, (_, index) =>
+      makeSimulatedFutureSession(subjectId, sessions.length + index),
+    ),
+  ];
 }
 
 export function computeAttendancePercent(attended: number, held: number) {
@@ -609,8 +654,7 @@ export function buildDashboardData(input: {
   // would force the minimum to 0 and report a false "not safe".
   const started = subjects.filter((subject) => subject.status !== "not-started");
 
-  // Weakest subject — advisory context, and the verdict only when the
-  // per-subject clause is being enforced.
+  // Weakest subject drives the current policy verdict.
   const weakest = [...started].sort(
     (a, b) =>
       a.bunkableClasses - b.bunkableClasses ||
@@ -689,8 +733,8 @@ export function buildDashboardData(input: {
         (subject) => subject.attendancePercent < threshold,
       ).length,
       explanation: perSubject
-        ? "Your weakest subject sets the limit, because 75% is required in each subject individually."
-        : "Based on your overall attendance, which is what the institute enforces. Missing a class costs more early in the semester, when the total is still small.",
+        ? "Your weakest subject sets the planning margin against the published 75% per-subject target."
+        : "Using aggregate attendance mode. Missing a class costs more early in the semester, when the total is still small.",
     },
   };
 }
@@ -799,10 +843,17 @@ function upcomingDatesWithClassesFromSlots(
     return [];
   }
 
+  if (timetable.length === 0) {
+    return [];
+  }
+
   const dates: Date[] = [];
   const cursor = startOfDay(startDate ?? new Date());
+  // A visible duration input has no arbitrary cap. Scan far enough to find the
+  // requested number even for a timetable with only one teaching day a week.
+  const scanLimit = Math.max(PROJECTION_DAY_LIMIT, leaveDays * 14 + 14);
 
-  for (let i = 0; i < PROJECTION_DAY_LIMIT && dates.length < leaveDays; i += 1) {
+  for (let i = 0; i < scanLimit && dates.length < leaveDays; i += 1) {
     if (timetable.some((slot) => slot.dayOfWeek === cursor.getDay())) {
       dates.push(new Date(cursor));
     }
@@ -874,26 +925,30 @@ function impactedSlotsFromRequest(
       const remaining = Math.max(0, wanted - exact.length);
       const lastSession = latestCalendarSession(calendarSessions);
       if (remaining === 0 || !lastSession) {
-        return exact;
+        return fillRequestedFutureCount(exact, wanted, request.subjectId);
       }
 
       const continuationStart = startOfDay(sessionStartDate(lastSession));
       continuationStart.setDate(continuationStart.getDate() + 1);
 
-      return [
+      return fillRequestedFutureCount([
         ...exact,
         ...upcomingSlotOccurrences(
           timetable.filter((slot) => matchesSubject(slot.subjectId)),
           remaining,
           continuationStart,
         ),
-      ];
+      ], wanted, request.subjectId);
     }
 
-    return upcomingSlotOccurrences(
-      timetable.filter((slot) => matchesSubject(slot.subjectId)),
+    return fillRequestedFutureCount(
+      upcomingSlotOccurrences(
+        timetable.filter((slot) => matchesSubject(slot.subjectId)),
+        wanted,
+        new Date(),
+      ),
       wanted,
-      new Date(),
+      request.subjectId,
     );
   }
 
@@ -912,7 +967,10 @@ function impactedSlotsFromRequest(
       );
       const dayKeys = new Set(days.map((date) => toDateKey(date)));
       const exact = calendarSessions.filter(
-        (session) => dayKeys.has(session.date) && matchesSubject(session.subjectId),
+        (session) =>
+          dayKeys.has(session.date) &&
+          matchesSubject(session.subjectId) &&
+          matchesLeaveDayPart(session.startTime, request.dayPart),
       );
 
       const remainingDays = Math.max(0, wantedDays - days.length);
@@ -937,7 +995,9 @@ function impactedSlotsFromRequest(
           timetable
             .filter(
               (slot) =>
-                slot.dayOfWeek === day.getDay() && matchesSubject(slot.subjectId),
+                slot.dayOfWeek === day.getDay() &&
+                matchesSubject(slot.subjectId) &&
+                matchesLeaveDayPart(slot.startTime, request.dayPart),
             )
             .map((slot) => makeSessionFromSlot(slot, day)),
         ),
@@ -948,7 +1008,10 @@ function impactedSlotsFromRequest(
       (day) =>
         timetable
           .filter(
-            (slot) => slot.dayOfWeek === day.getDay() && matchesSubject(slot.subjectId),
+            (slot) =>
+              slot.dayOfWeek === day.getDay() &&
+              matchesSubject(slot.subjectId) &&
+              matchesLeaveDayPart(slot.startTime, request.dayPart),
           )
           .map((slot) => makeSessionFromSlot(slot, day)),
     );
@@ -1088,7 +1151,7 @@ export function simulateAttendance(args: {
       name: subject.name,
       attended: subject.attendedClasses,
       held: subject.heldClasses + missed,
-      started: subject.heldClasses > 0,
+      started: subject.heldClasses + missed > 0,
     };
   });
 
@@ -1157,7 +1220,7 @@ export function simulateAttendance(args: {
         startDate: new Date(),
       });
 
-  // Weakest subject after the absence — advisory unless per-subject is enforced.
+  // Weakest subject after the absence.
   const weakestAfter = [...afterStarted]
     .map((subject) => ({
       name: subject.name,
@@ -1201,6 +1264,17 @@ export function simulateAttendance(args: {
       thresholdBreaches: projections.filter(
         (projection) => projection.afterPercent < threshold,
       ).length,
+      subjectsBelowThreshold: afterStarted.filter(
+        (subject) => computeAttendancePercent(subject.attended, subject.held) < threshold,
+      ).length,
+      newThresholdBreaches: afterStarted.filter((subject) => {
+        const afterPercent = computeAttendancePercent(subject.attended, subject.held);
+        const original = args.subjects.find((candidate) => candidate.id === subject.id);
+        const beforePercent = original
+          ? computeAttendancePercent(original.attendedClasses, original.heldClasses)
+          : 100;
+        return afterPercent < threshold && beforePercent >= threshold;
+      }).length,
     },
   };
 }

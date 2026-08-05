@@ -1,10 +1,10 @@
 /**
  * Popup controller.
  *
- * The headline answers one question — "can I miss a class right now?" — and it
- * answers it from the student's WEAKEST subject, because NIET requires 75% in
- * each subject individually. Aggregate percentage is shown as supporting
- * detail only, so it can be cross-checked against the ERP.
+ * The headline shows the student's margin against NIET's published 75% target.
+ * It is deliberately advisory: the extension cannot decide exam eligibility,
+ * condonation, or exceptions. Aggregate percentage remains supporting context
+ * that can be cross-checked against the ERP.
  */
 
 import type { DashboardData, DashboardSubject, SimulationResult } from "@/lib/types";
@@ -87,16 +87,28 @@ function renderVerdict(dashboard: DashboardData) {
   verdict.dataset.state = overall.status;
 
   if (overall.status === "critical") {
-    const need = overall.recoveryClassesNeeded;
-    headline.textContent = "Below 75% — do not miss class";
-    detail.textContent = `You are at ${overall.attendancePercent}% overall. Attend ${need} more ${plural(need, "class")} in a row to get back above 75%.`;
+    const weakest = dashboard.subjects.find(
+      (subject) => subject.id === overall.weakestSubjectId,
+    );
+    if (overall.attendancePercent < dashboard.policy.thresholdPercent) {
+      const need = overall.recoveryClassesNeeded;
+      headline.textContent = "Below the 75% planning target";
+      detail.textContent = `You are at ${overall.attendancePercent}% overall. ${need} attended ${plural(need, "class")} would return you to 75%; this does not decide exam eligibility.`;
+    } else if (weakest) {
+      const need = weakest.recoveryClassesNeeded;
+      headline.textContent = `${weakest.name} is below the target`;
+      detail.textContent = `It is at ${weakest.attendancePercent}%. ${need} attended ${plural(need, "class")} would return it to 75%; overall is ${overall.attendancePercent}%.`;
+    } else {
+      headline.textContent = "A subject is below the target";
+      detail.textContent = `Your overall attendance is ${overall.attendancePercent}%. This is a planning warning, not an exam-eligibility decision.`;
+    }
   } else if (overall.safeToMissClasses === 0) {
-    headline.textContent = "No margin left";
-    detail.textContent = `You are at ${overall.attendancePercent}% overall. The next missed class drops you below 75%.`;
+    headline.textContent = "At the 75% planning limit";
+    detail.textContent = `Another recorded absence would move a subject below the target. NIET and the ERP remain authoritative.`;
   } else {
     const count = overall.safeToMissClasses;
-    headline.textContent = `Safe to miss ${count} ${plural(count, "class")}`;
-    detail.textContent = `You are at ${overall.attendancePercent}% overall and would stay above 75%.`;
+    headline.textContent = `${count} ${plural(count, "class")} of margin to 75%`;
+    detail.textContent = `Your weakest subject would stay at or above the published target. Overall attendance is ${overall.attendancePercent}%.`;
   }
 
   const stats: Array<[string, string]> = [];
@@ -117,9 +129,7 @@ function renderVerdict(dashboard: DashboardData) {
     meta.append(item);
   }
 
-  // Advisory only. The institute enforces the overall figure, but a subject far
-  // below the line is worth knowing about — so it is mentioned without being
-  // dressed up as a verdict the student would act on.
+  // Keep a concise subject-level note beside the primary verdict.
   renderWeakSubjectNote(dashboard);
 }
 
@@ -145,7 +155,7 @@ function renderWeakSubjectNote(dashboard: DashboardData) {
 
   note.append(
     el("span", "weak-note__label", label),
-    el("span", "weak-note__hint", "Your overall is fine — this is just worth watching."),
+    el("span", "weak-note__hint", "Published planning target; approved exceptions may apply."),
   );
 }
 
@@ -258,7 +268,7 @@ function renderSimResult(result: SimulationResult) {
   $("sim-result-title").textContent = `${overall.beforePercent}% → ${overall.afterPercent}% overall`;
 
   const status = $("sim-result-status");
-  status.textContent = overall.status === "critical" ? "Not safe" : overall.status === "warning" ? "Tight" : "Safe";
+  status.textContent = overall.status === "critical" ? "Below target" : overall.status === "warning" ? "Close to target" : "Above target";
   status.className = `pill pill--${overall.status}`;
 
   const body = $("sim-result-body");
@@ -267,9 +277,9 @@ function renderSimResult(result: SimulationResult) {
   if (missed === 0) {
     body.textContent = "No classes fall in that window, so your attendance is unchanged.";
   } else if (overall.status === "critical") {
-    body.textContent = `Missing ${missed} ${plural(missed, "class")} drops you to ${overall.afterPercent}% overall, below the 75% you need. You would have to attend ${overall.recoveryClassesNeeded} in a row to recover.`;
+    body.textContent = `Missing ${missed} ${plural(missed, "class")} drops you to ${overall.afterPercent}% overall, below the published 75% target. ${overall.recoveryClassesNeeded} attended ${plural(overall.recoveryClassesNeeded, "class")} would return you to it; eligibility is decided by NIET.`;
   } else {
-    body.textContent = `Missing ${missed} ${plural(missed, "class")} leaves you at ${overall.afterPercent}% overall, still above 75%.`;
+    body.textContent = `Missing ${missed} ${plural(missed, "class")} leaves you at ${overall.afterPercent}% overall, still above the published target.`;
   }
 
   const stats = $("sim-result-stats");
@@ -277,7 +287,7 @@ function renderSimResult(result: SimulationResult) {
 
   const entries: Array<[string, string]> = [
     ["Classes missed", `${missed}`],
-    ["Days off still safe", `${overall.safeLeaveDaysRemaining}`],
+    ["Days within target", `${overall.safeLeaveDaysRemaining}`],
   ];
 
   if (overall.recoveryClassesNeeded > 0) {

@@ -63,6 +63,52 @@ type ParsedSubject = {
   attendancePercent?: number;
 };
 
+type PlannerDashboard = {
+  overall: {
+    attendedClasses: number;
+    heldClasses: number;
+    attendancePercent: number;
+  };
+  subjects: Array<{
+    id: string;
+    code: string;
+    name: string;
+    heldClasses: number;
+    attendedClasses: number;
+    attendancePercent: number;
+    recoveryClassesNeeded: number;
+    status: "safe" | "warning" | "critical" | "not-started";
+  }>;
+  calendarSessions: CalendarSession[];
+};
+
+type PlannerSimulationResult = {
+  projections: Array<{
+    subjectId: string;
+    subjectName: string;
+    beforePercent: number;
+    afterPercent: number;
+    deltaPercent: number;
+    recoveryClassesNeeded: number;
+    status: "safe" | "warning" | "critical";
+  }>;
+  overall: {
+    beforePercent: number;
+    afterPercent: number;
+    deltaPercent: number;
+    classesMissed: number;
+    recoveryClassesNeeded: number;
+    status: "safe" | "warning" | "critical";
+  };
+  summary: {
+    impactedSubjects: number;
+    classesMissed: number;
+    thresholdBreaches: number;
+    subjectsBelowThreshold: number;
+    newThresholdBreaches: number;
+  };
+};
+
 type PortalTimetableRow = {
   lectureDate?: string;
   startTimeHM?: string;
@@ -553,8 +599,8 @@ function injectOverlayBadges() {
   const totalAttended = subjects.reduce((sum, s) => sum + s.attendedClasses, 0);
   const totalHeld = subjects.reduce((sum, s) => sum + s.heldClasses, 0);
 
-  // Overall is what the institute enforces, so the bar reports on that and the
-  // number always agrees with the portal's own figure.
+  // Keep the portal's aggregate figure visible as context. The 75% calculations
+  // are planning guidance and do not claim to decide exam eligibility.
   const overallPercent = computeAttendancePercent(totalAttended, totalHeld);
   const safeToMiss = computeBunkableClasses(totalAttended, totalHeld, THRESHOLD);
   const overallStatus = getSubjectStatus(overallPercent, THRESHOLD);
@@ -574,7 +620,7 @@ function injectOverlayBadges() {
     <span class="niet-planner-summary__caption">${
       belowCount > 0
         ? `${belowCount} subject${belowCount === 1 ? "" : "s"} below 75%`
-        : "Based on your overall attendance"
+        : "Compared with the 75% planning target"
     }</span>
   `;
 
@@ -586,7 +632,7 @@ function injectOverlayBadges() {
       <strong class="niet-planner-status--${overallStatus}">${overallPercent}%</strong>
     </span>
     <span class="niet-planner-summary__stat">
-      Safe to miss
+      Margin to 75%
       <strong class="niet-planner-status--${overallStatus}">${safeToMiss}</strong>
     </span>
     <span class="niet-planner-summary__stat">
@@ -667,14 +713,501 @@ function injectOverlayBadges() {
       badge.textContent = "Not started";
     } else if (percent < THRESHOLD) {
       badge.className = "niet-planner-badge niet-planner-badge--critical";
-      badge.textContent = `${recovery} to reach 75%`;
+      badge.textContent = `${recovery} to 75%`;
     } else {
       badge.className = "niet-planner-badge niet-planner-badge--safe";
-      badge.textContent = "Above 75%";
+      badge.textContent = "75%+";
     }
 
     cells[cells.length - 1].appendChild(badge);
   });
+}
+
+function plural(count: number, singular: string, pluralForm = `${singular}s`) {
+  return count === 1 ? singular : pluralForm;
+}
+
+function tomorrowDateKey() {
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  return toDateKey(tomorrow);
+}
+
+function formatPlannerDate(dateKey: string) {
+  const [year, month, day] = dateKey.split("-").map(Number);
+  return new Date(year, (month ?? 1) - 1, day ?? 1).toLocaleDateString("en-GB", {
+    weekday: "short",
+    day: "2-digit",
+    month: "short",
+  });
+}
+
+function nextScheduledDate(dashboard: PlannerDashboard) {
+  const tomorrow = tomorrowDateKey();
+  return (
+    dashboard.calendarSessions
+      .map((session) => session.date)
+      .filter((date) => date >= tomorrow)
+      .sort((a, b) => a.localeCompare(b))[0] ?? tomorrow
+  );
+}
+
+function plannerElement<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  className?: string,
+  text?: string,
+) {
+  const element = document.createElement(tag);
+  if (className) {
+    element.className = className;
+  }
+  if (text !== undefined) {
+    element.textContent = text;
+  }
+  return element;
+}
+
+function setSelectOptions(
+  select: HTMLSelectElement,
+  options: Array<{ value: string; label: string }>,
+) {
+  select.replaceChildren(
+    ...options.map(({ value, label }) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      return option;
+    }),
+  );
+}
+
+async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
+  clearOverlay();
+
+  if (!overlayEnabled) {
+    return;
+  }
+
+  const subjects = scrapeAttendanceFromDOM();
+  const attendanceTable = findAttendanceTableElement();
+  if (subjects.length === 0 || !attendanceTable) {
+    return;
+  }
+
+  let dashboard = providedDashboard;
+  if (!dashboard) {
+    const response = await chrome.runtime.sendMessage({ type: "GET_DASHBOARD" }).catch(() => null);
+    dashboard = response?.success ? (response.dashboard as PlannerDashboard) : undefined;
+  }
+
+  if (!dashboard || dashboard.subjects.length === 0) {
+    return;
+  }
+
+  const planner = plannerElement("section", "niet-leave-planner");
+  planner.setAttribute(OVERLAY_ATTR, "planner");
+  planner.setAttribute("aria-label", "Plan a leave");
+
+  const primary = plannerElement("div", "niet-leave-planner__primary");
+  const headingRow = plannerElement("div", "niet-leave-planner__heading-row");
+  const headingCopy = plannerElement("div");
+  const title = plannerElement("h2", "niet-leave-planner__title", "Plan a leave");
+  const caption = plannerElement(
+    "p",
+    "niet-leave-planner__caption",
+    "Check the impact before you apply.",
+  );
+  headingCopy.append(title, caption);
+
+  const current = plannerElement(
+    "p",
+    "niet-leave-planner__current",
+    `Current attendance ${dashboard.overall.attendancePercent}% · ${dashboard.overall.attendedClasses} of ${dashboard.overall.heldClasses} classes`,
+  );
+  headingRow.append(headingCopy, current);
+
+  const controls = plannerElement("div", "niet-leave-planner__controls");
+  const leaveToggle = plannerElement("div", "niet-leave-planner__toggle");
+  leaveToggle.setAttribute("role", "group");
+  leaveToggle.setAttribute("aria-label", "Leave length");
+
+  const fullDayButton = plannerElement(
+    "button",
+    "niet-leave-planner__toggle-button is-active",
+    "Full day",
+  );
+  fullDayButton.type = "button";
+  fullDayButton.setAttribute("aria-pressed", "true");
+  const halfDayButton = plannerElement(
+    "button",
+    "niet-leave-planner__toggle-button",
+    "Half day",
+  );
+  halfDayButton.type = "button";
+  halfDayButton.setAttribute("aria-pressed", "false");
+  leaveToggle.append(fullDayButton, halfDayButton);
+
+  const dateControl = plannerElement("label", "niet-leave-planner__date");
+  const dateInput = document.createElement("input");
+  dateInput.type = "date";
+  dateInput.setAttribute("aria-label", "Leave starting date");
+  dateInput.value = nextScheduledDate(dashboard);
+  const dateText = plannerElement(
+    "span",
+    "niet-leave-planner__date-text",
+    formatPlannerDate(dateInput.value),
+  );
+  dateControl.append(dateInput, dateText);
+
+  const durationControl = plannerElement("label", "niet-leave-planner__count");
+  const durationInput = document.createElement("input");
+  durationInput.type = "number";
+  durationInput.min = "1";
+  durationInput.step = "1";
+  durationInput.value = "1";
+  durationInput.inputMode = "numeric";
+  durationInput.setAttribute("aria-label", "Leave duration in days");
+  const durationUnit = plannerElement("span", "niet-leave-planner__count-unit", "day");
+  durationControl.append(durationInput, durationUnit);
+
+  const dayPartSelect = document.createElement("select");
+  dayPartSelect.className = "niet-leave-planner__select";
+  dayPartSelect.setAttribute("aria-label", "Half day timing");
+  dayPartSelect.hidden = true;
+  setSelectOptions(dayPartSelect, [
+    { value: "morning", label: "Morning" },
+    { value: "afternoon", label: "Afternoon" },
+  ]);
+
+  const checkButton = plannerElement(
+    "button",
+    "niet-leave-planner__check",
+    "Check impact",
+  );
+  checkButton.type = "button";
+
+  const dayControls = plannerElement("div", "niet-leave-planner__day-controls");
+  dayControls.append(leaveToggle, dateControl, durationControl, dayPartSelect, checkButton);
+
+  const classControls = plannerElement("div", "niet-leave-planner__class-controls");
+  classControls.hidden = true;
+  const subjectSelect = document.createElement("select");
+  subjectSelect.className = "niet-leave-planner__subject-select";
+  subjectSelect.setAttribute("aria-label", "Subject");
+  setSelectOptions(
+    subjectSelect,
+    dashboard.subjects.map((subject) => ({ value: subject.id, label: subject.name })),
+  );
+  const classCountControl = plannerElement("label", "niet-leave-planner__count");
+  const classCountInput = document.createElement("input");
+  classCountInput.type = "number";
+  classCountInput.min = "1";
+  classCountInput.step = "1";
+  classCountInput.value = "1";
+  classCountInput.inputMode = "numeric";
+  classCountInput.setAttribute("aria-label", "Classes to miss");
+  const classCountUnit = plannerElement("span", "niet-leave-planner__count-unit", "class");
+  classCountControl.append(classCountInput, classCountUnit);
+  const classCheckButton = plannerElement(
+    "button",
+    "niet-leave-planner__check",
+    "Check impact",
+  );
+  classCheckButton.type = "button";
+  classControls.append(subjectSelect, classCountControl, classCheckButton);
+
+  controls.append(dayControls, classControls);
+  primary.append(headingRow, controls);
+
+  const result = plannerElement("div", "niet-leave-planner__result");
+  result.setAttribute("aria-live", "polite");
+  result.dataset.state = "loading";
+  const resultLabel = plannerElement(
+    "p",
+    "niet-leave-planner__result-label",
+    "Projected overall attendance",
+  );
+  const resultComparison = plannerElement("div", "niet-leave-planner__comparison");
+  const resultBefore = plannerElement(
+    "span",
+    "niet-leave-planner__before",
+    `${dashboard.overall.attendancePercent}%`,
+  );
+  const resultArrow = plannerElement("span", "niet-leave-planner__arrow", "→");
+  resultArrow.setAttribute("aria-hidden", "true");
+  const resultAfter = plannerElement(
+    "span",
+    "niet-leave-planner__after",
+    `${dashboard.overall.attendancePercent}%`,
+  );
+  resultComparison.append(resultBefore, resultArrow, resultAfter);
+  const resultDelta = plannerElement(
+    "p",
+    "niet-leave-planner__delta",
+    "No change",
+  );
+  const resultDetail = plannerElement(
+    "p",
+    "niet-leave-planner__result-detail",
+    "Calculating the classes affected…",
+  );
+  const resultFoot = plannerElement("p", "niet-leave-planner__result-foot", "");
+  result.append(resultLabel, resultComparison, resultDelta, resultDetail, resultFoot);
+
+  const classModeButton = plannerElement(
+    "button",
+    "niet-leave-planner__class-link",
+    "Plan individual classes",
+  );
+  classModeButton.type = "button";
+
+  planner.append(primary, result, classModeButton);
+  attendanceTable.parentElement?.insertBefore(planner, attendanceTable);
+
+  let dayPart: "full" | "morning" | "afternoon" = "full";
+  let classMode = false;
+
+  const positiveInteger = (input: HTMLInputElement) => {
+    const value = Math.floor(Number(input.value));
+    if (!Number.isFinite(value) || value < 1) {
+      input.setCustomValidity("Enter a whole number greater than zero.");
+      input.reportValidity();
+      return null;
+    }
+
+    input.setCustomValidity("");
+    input.value = `${value}`;
+    return value;
+  };
+
+  const syncCountUnit = (
+    input: HTMLInputElement,
+    unit: HTMLElement,
+    singular: string,
+    pluralForm: string,
+  ) => {
+    const value = Math.floor(Number(input.value));
+    unit.textContent = value === 1 ? singular : pluralForm;
+  };
+
+  const renderResult = (projection: PlannerSimulationResult) => {
+    const { overall, summary } = projection;
+    const subjectProjection = classMode
+      ? projection.projections.find((item) => item.subjectId === subjectSelect.value)
+      : undefined;
+    const beforePercent = subjectProjection?.beforePercent ?? overall.beforePercent;
+    const afterPercent = subjectProjection?.afterPercent ?? overall.afterPercent;
+    const deltaPercent = subjectProjection?.deltaPercent ?? overall.deltaPercent;
+    const status = subjectProjection?.status ?? overall.status;
+
+    result.dataset.state = summary.classesMissed === 0 ? "neutral" : status;
+    resultLabel.textContent = classMode
+      ? (subjectProjection?.subjectName ?? "Selected subject")
+      : "Projected overall attendance";
+    resultBefore.textContent = `${beforePercent}%`;
+    resultAfter.textContent = `${afterPercent}%`;
+    resultDelta.textContent = deltaPercent > 0
+      ? `${deltaPercent} ${plural(deltaPercent, "point", "points")} lower`
+      : "No change";
+
+    if (summary.classesMissed === 0) {
+      resultLabel.textContent = "No classes scheduled";
+      resultDetail.textContent = "Your attendance stays unchanged.";
+      resultFoot.textContent = "No attendance impact";
+      return;
+    }
+
+    if (classMode && subjectProjection) {
+      resultDetail.textContent = `${summary.classesMissed} ${plural(summary.classesMissed, "class", "classes")} missed · overall ${overall.beforePercent}% → ${overall.afterPercent}%`;
+      if (subjectProjection.afterPercent < THRESHOLD) {
+        const crossing = subjectProjection.beforePercent >= THRESHOLD ? "Falls" : "Remains";
+        resultFoot.textContent = `${crossing} below the 75% target · ${subjectProjection.recoveryClassesNeeded} ${plural(subjectProjection.recoveryClassesNeeded, "class", "classes")} to return`;
+      } else {
+        resultFoot.textContent = "Stays at or above the 75% target";
+      }
+      return;
+    }
+
+    resultDetail.textContent = `${summary.classesMissed} ${plural(summary.classesMissed, "class", "classes")} across ${summary.impactedSubjects} ${plural(summary.impactedSubjects, "subject", "subjects")}`;
+    if (summary.subjectsBelowThreshold > 0) {
+      resultFoot.textContent = summary.newThresholdBreaches > 0
+        ? `${summary.newThresholdBreaches} new ${plural(summary.newThresholdBreaches, "subject", "subjects")} ${summary.newThresholdBreaches === 1 ? "falls" : "fall"} below the 75% target`
+        : `${summary.subjectsBelowThreshold} ${plural(summary.subjectsBelowThreshold, "subject", "subjects")} ${summary.subjectsBelowThreshold === 1 ? "remains" : "remain"} below the 75% target`;
+    } else {
+      resultFoot.textContent = "All subjects remain at or above the 75% target";
+    }
+  };
+
+  const renderPreviewError = (message: string) => {
+    result.dataset.state = "critical";
+    resultLabel.textContent = "Could not check this leave";
+    resultBefore.textContent = `${dashboard!.overall.attendancePercent}%`;
+    resultAfter.textContent = "—";
+    resultDelta.textContent = "Not calculated";
+    resultDetail.textContent = message;
+    resultFoot.textContent = "Try refreshing the attendance page";
+  };
+
+  const preview = async () => {
+    const activeButton = classMode ? classCheckButton : checkButton;
+    const requestedCount = classMode
+      ? positiveInteger(classCountInput)
+      : dayPart === "full"
+        ? positiveInteger(durationInput)
+        : 1;
+    if (requestedCount === null) {
+      return;
+    }
+
+    activeButton.disabled = true;
+    activeButton.textContent = "Checking…";
+    result.dataset.state = "loading";
+
+    const payload = classMode
+      ? {
+          mode: "future-count",
+          subjectId: subjectSelect.value,
+          futureClasses: requestedCount,
+        }
+      : {
+          mode: "leave-days",
+          leaveDays: requestedCount,
+          dayPart,
+          fromDate: dateInput.value,
+        };
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "PREVIEW_SIMULATION",
+        payload,
+      });
+      if (!response?.success || !response.result) {
+        throw new Error(response?.error ?? "The timetable could not be checked.");
+      }
+      renderResult(response.result as PlannerSimulationResult);
+    } catch (error) {
+      renderPreviewError(error instanceof Error ? error.message : "The timetable could not be checked.");
+    } finally {
+      activeButton.disabled = false;
+      activeButton.textContent = "Check impact";
+    }
+  };
+
+  const setLeaveLength = (nextPart: "full" | "morning") => {
+    dayPart = nextPart;
+    const isFullDay = nextPart === "full";
+    fullDayButton.classList.toggle("is-active", isFullDay);
+    fullDayButton.setAttribute("aria-pressed", `${isFullDay}`);
+    halfDayButton.classList.toggle("is-active", !isFullDay);
+    halfDayButton.setAttribute("aria-pressed", `${!isFullDay}`);
+
+    if (isFullDay) {
+      durationControl.hidden = false;
+      dayPartSelect.hidden = true;
+    } else {
+      durationControl.hidden = true;
+      dayPartSelect.hidden = false;
+      dayPartSelect.value = "morning";
+    }
+  };
+
+  fullDayButton.addEventListener("click", () => {
+    setLeaveLength("full");
+    void preview();
+  });
+  halfDayButton.addEventListener("click", () => {
+    setLeaveLength("morning");
+    void preview();
+  });
+  durationInput.addEventListener("input", () => {
+    durationInput.setCustomValidity("");
+    syncCountUnit(durationInput, durationUnit, "day", "days");
+  });
+  classCountInput.addEventListener("input", () => {
+    classCountInput.setCustomValidity("");
+    syncCountUnit(classCountInput, classCountUnit, "class", "classes");
+  });
+  dayPartSelect.addEventListener("change", () => {
+    dayPart = dayPartSelect.value === "afternoon" ? "afternoon" : "morning";
+  });
+  dateInput.addEventListener("change", () => {
+    if (dateInput.value) {
+      dateText.textContent = formatPlannerDate(dateInput.value);
+    }
+  });
+  checkButton.addEventListener("click", () => void preview());
+  classCheckButton.addEventListener("click", () => void preview());
+  classModeButton.addEventListener("click", () => {
+    classMode = !classMode;
+    dayControls.hidden = classMode;
+    classControls.hidden = !classMode;
+    title.textContent = classMode ? "Plan individual classes" : "Plan a leave";
+    caption.textContent = classMode
+      ? "Check a subject before you miss class."
+      : "Check the impact before you apply.";
+    classModeButton.textContent = classMode ? "Back to day leave" : "Plan individual classes";
+    void preview();
+  });
+
+  const columns = getAttendanceColumns(attendanceTable);
+  const subjectsByKey = new Map(
+    subjects.map((subject) => [
+      `${subject.code.toLowerCase()}::${subject.name.toLowerCase()}`,
+      subject,
+    ]),
+  );
+
+  attendanceTable.querySelectorAll("tr").forEach((row) => {
+    const cells = row.querySelectorAll("td");
+    if (cells.length < 4) {
+      return;
+    }
+
+    const cellTexts = Array.from(cells).map((cell) =>
+      normalizeWhitespace(cell.textContent ?? ""),
+    );
+    const parsedRow = columns
+      ? parseHeaderMappedRow(cellTexts, columns)
+      : parseLegacyRow(cellTexts);
+    if (!parsedRow) {
+      return;
+    }
+
+    const subject = subjectsByKey.get(
+      `${parsedRow.code.toLowerCase()}::${parsedRow.name.toLowerCase()}`,
+    );
+    if (!subject) {
+      return;
+    }
+
+    const percent = computeAttendancePercent(
+      subject.attendedClasses,
+      subject.heldClasses,
+    );
+    const recovery = computeRecoveryClassesNeeded(
+      subject.attendedClasses,
+      subject.heldClasses,
+      THRESHOLD,
+    );
+
+    const note = document.createElement("span");
+    note.setAttribute(OVERLAY_ATTR, "status");
+
+    if (subject.heldClasses === 0) {
+      note.className = "niet-attendance-note niet-attendance-note--neutral";
+      note.textContent = "Not started";
+    } else if (percent < THRESHOLD) {
+      note.className = "niet-attendance-note niet-attendance-note--critical";
+      note.textContent = `${recovery} to 75%`;
+    } else {
+      note.className = "niet-attendance-note niet-attendance-note--safe";
+      note.textContent = "75%+";
+    }
+
+    cells[cells.length - 1].appendChild(note);
+  });
+
+  await preview();
 }
 
 async function sendAttendanceToServiceWorker(student: StudentContext) {
@@ -683,7 +1216,7 @@ async function sendAttendanceToServiceWorker(student: StudentContext) {
     return;
   }
 
-  await chrome.runtime.sendMessage({
+  const response = await chrome.runtime.sendMessage({
     type: "ATTENDANCE_SCRAPED",
     payload: buildSnapshot(
       subjects,
@@ -692,6 +1225,8 @@ async function sendAttendanceToServiceWorker(student: StudentContext) {
       student,
     ),
   });
+
+  return response?.success ? (response.dashboard as PlannerDashboard) : undefined;
 }
 
 function deriveSubjectCode(row: PortalTimetableRow) {
@@ -998,22 +1533,23 @@ async function syncPortalData(force = false) {
   }
 
   const signature = subjectSignature();
-  if (!force && signature === lastSignature) {
+  if (!force && signature === lastSignature && !timetableImported) {
     return { found: true, imported: false, timetableImported };
   }
 
   lastSignature = signature;
 
-  // Suspend observation while we write to the page, otherwise our own badge
+  const dashboard = await sendAttendanceToServiceWorker(student);
+
+  // Suspend observation while we write to the page, otherwise our own planner
   // insertions retrigger the observer and it rescans forever.
   injecting = true;
   try {
-    injectOverlayBadges();
+    await injectAttendancePlanner(dashboard);
   } finally {
     injecting = false;
   }
 
-  await sendAttendanceToServiceWorker(student);
   return { found: true, imported: true, timetableImported };
 }
 
@@ -1080,16 +1616,23 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     overlayEnabled = Boolean(message.payload);
     if (!overlayEnabled) {
       clearOverlay();
+      sendResponse({ success: true });
+      return false;
     } else {
       injecting = true;
-      try {
-        injectOverlayBadges();
-      } finally {
-        injecting = false;
-      }
+      injectAttendancePlanner()
+        .then(() => sendResponse({ success: true }))
+        .catch((error) =>
+          sendResponse({
+            success: false,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        )
+        .finally(() => {
+          injecting = false;
+        });
+      return true;
     }
-    sendResponse({ success: true });
-    return false;
   }
 
   if (message?.type !== "SCRAPE_ATTENDANCE") {

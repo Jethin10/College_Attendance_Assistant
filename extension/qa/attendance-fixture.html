@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NIET Attendance Planner QA</title>
+    <link rel="stylesheet" href="../dist/content/content.css" />
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; background: #fff; color: #111; font-family: Arial, sans-serif; font-size: 12px; }
+      .topbar { height: 62px; background: #075b95; }
+      .nav { height: 40px; border-bottom: 1px solid #aaa; background: #fff; }
+      main { padding: 18px 28px 48px; }
+      .section-label { margin: 0 0 18px 8px; color: #00a89d; font-size: 12px; }
+      .shell { padding: 14px; background: #f1f6fa; }
+      .term { height: 66px; padding: 15px; border: 1px solid #c7d6e2; border-radius: 14px; background: #fff; }
+      .term select { width: 220px; height: 34px; margin-left: 12px; border: 1px solid #c7d6e2; border-radius: 4px; color: #4b5560; background: #fff; }
+      .tabs { display: flex; gap: 10px; margin: 10px 6px 8px; }
+      .tab { min-width: 96px; padding: 8px 18px; border-radius: 8px; background: #fff; text-align: center; font-weight: 600; }
+      .tab.active { background: #09a2df; color: #fff; }
+      .attendance { overflow: hidden; border: 1px solid #c7d6e2; border-radius: 14px; background: #fff; }
+      table { width: calc(100% - 32px); margin: 0 16px 16px; border-collapse: collapse; }
+      th { height: 42px; padding: 0 10px; background: #f5f5f5; color: #005b9e; font-weight: 600; text-align: center; }
+      td { height: 43px; padding: 0 10px; text-align: center; white-space: nowrap; }
+      td:nth-child(3), td:nth-child(4), th:nth-child(3), th:nth-child(4) { text-align: left; }
+      tfoot td { background: #eef4f8; font-weight: 600; }
+    </style>
+    <script>
+      const threshold = 75;
+      const baseSubjects = [
+        { id: "remedial", code: "Activity and Remedial Class", name: "Activity and Remedial Class", attendedClasses: 2, heldClasses: 2 },
+        { id: "ai", code: "CCSAI0301", name: "Artificial Intelligence", attendedClasses: 7, heldClasses: 8 },
+        { id: "ethics", code: "CNC0301", name: "Artificial Intelligence and Cyber Ethics", attendedClasses: 2, heldClasses: 2 },
+        { id: "ailab", code: "CCSAI0351", name: "Artificial Intelligence lab", attendedClasses: 2, heldClasses: 4 },
+        { id: "architecture", code: "CCSE0304", name: "Computer Architecture & Parallel Processing", attendedClasses: 4, heldClasses: 4 },
+        { id: "dsa", code: "CCSE0301", name: "Data Structures and Algorithm-II", attendedClasses: 3, heldClasses: 3 },
+        { id: "dsalab", code: "CCSE0351", name: "Data Structures and Algorithm-II Lab", attendedClasses: 0, heldClasses: 0 },
+        { id: "esd", code: "CCSCC0301", name: "Employability Skill Development-I", attendedClasses: 36, heldClasses: 40 },
+        { id: "internship", code: "CCSE359", name: "Internship-I", attendedClasses: 4, heldClasses: 6 },
+        { id: "java", code: "CCSE0355", name: "Object Oriented Techniques using Java", attendedClasses: 68, heldClasses: 76 },
+        { id: "os", code: "CCSE0303A", name: "Operating Systems", attendedClasses: 5, heldClasses: 6 },
+        { id: "oslab", code: "CCSE0353A", name: "Operating Systems Lab", attendedClasses: 0, heldClasses: 0 },
+        { id: "communication", code: "CASL0301", name: "Technical Communication", attendedClasses: 0, heldClasses: 0 },
+      ];
+      const round2 = (value) => Number(value.toFixed(2));
+      const percent = (attended, held) => held > 0 ? round2(attended / held * 100) : 0;
+      const recovery = (attended, held) => Math.max(0, Math.ceil((.75 * held - attended) / .25));
+      const risk = (value) => value < 75 ? "critical" : value < 80 ? "warning" : "safe";
+      const dashboardSubjects = baseSubjects.map((subject) => ({
+        ...subject,
+        attendancePercent: percent(subject.attendedClasses, subject.heldClasses),
+        recoveryClassesNeeded: recovery(subject.attendedClasses, subject.heldClasses),
+        status: subject.heldClasses === 0 ? "not-started" : risk(percent(subject.attendedClasses, subject.heldClasses)),
+      }));
+      const calendarSessions = [
+        ["remedial", "09:00"], ["ai", "10:00"], ["ai", "11:00"],
+        ["ethics", "13:00"], ["architecture", "14:00"], ["dsa", "15:00"],
+      ].map(([subjectId, startTime], index) => ({
+        id: `fixture-${index}`, subjectId, subjectCode: subjectId, subjectName: subjectId,
+        date: "2026-08-06", dayOfWeek: 4, startTime, endTime: startTime,
+        source: "portal",
+      }));
+      const dashboard = {
+        overall: { attendedClasses: 133, heldClasses: 151, attendancePercent: 88.08 },
+        subjects: dashboardSubjects,
+        calendarSessions,
+      };
+
+      function simulate(request) {
+        const missed = new Map();
+        if (request.mode === "future-count") {
+          missed.set(request.subjectId, Math.max(1, Math.floor(request.futureClasses || 1)));
+        } else {
+          const days = Math.max(1, Math.floor(request.leaveDays || 1));
+          const daySessions = request.dayPart === "morning"
+            ? calendarSessions.slice(0, 3)
+            : request.dayPart === "afternoon"
+              ? calendarSessions.slice(3)
+              : Array.from({ length: days }, () => calendarSessions).flat();
+          for (const session of daySessions) {
+            missed.set(session.subjectId, (missed.get(session.subjectId) || 0) + 1);
+          }
+        }
+
+        const projections = dashboardSubjects
+          .filter((subject) => missed.has(subject.id))
+          .map((subject) => {
+            const count = missed.get(subject.id);
+            const beforePercent = percent(subject.attendedClasses, subject.heldClasses);
+            const afterPercent = percent(subject.attendedClasses, subject.heldClasses + count);
+            return {
+              subjectId: subject.id,
+              subjectName: subject.name,
+              beforePercent,
+              afterPercent,
+              deltaPercent: round2(beforePercent - afterPercent),
+              recoveryClassesNeeded: recovery(subject.attendedClasses, subject.heldClasses + count),
+              status: risk(afterPercent),
+            };
+          });
+        const classesMissed = [...missed.values()].reduce((sum, count) => sum + count, 0);
+        const afterPercent = round2(133 / (151 + classesMissed) * 100);
+        const afterSubjects = dashboardSubjects.filter((subject) => subject.heldClasses + (missed.get(subject.id) || 0) > 0);
+        const below = afterSubjects.filter((subject) => percent(subject.attendedClasses, subject.heldClasses + (missed.get(subject.id) || 0)) < threshold);
+        const newlyBelow = below.filter((subject) => percent(subject.attendedClasses, subject.heldClasses) >= threshold);
+        return {
+          projections,
+          impactedSlots: [],
+          overall: {
+            beforePercent: 88.08,
+            afterPercent,
+            deltaPercent: round2(88.08 - afterPercent),
+            classesMissed,
+            recoveryClassesNeeded: 0,
+            status: below.length ? "critical" : risk(afterPercent),
+          },
+          summary: {
+            impactedSubjects: projections.length,
+            classesMissed,
+            thresholdBreaches: projections.filter((item) => item.afterPercent < threshold).length,
+            subjectsBelowThreshold: below.length,
+            newThresholdBreaches: newlyBelow.length,
+          },
+        };
+      }
+
+      window.chrome = {
+        runtime: {
+          sendMessage: async (message) => {
+            if (message.type === "GET_PREFERENCES") return { success: true, preferences: { showPageOverlay: true } };
+            if (message.type === "GET_DASHBOARD" || message.type === "ATTENDANCE_SCRAPED") return { success: true, dashboard };
+            if (message.type === "PREVIEW_SIMULATION") return { success: true, result: simulate(message.payload) };
+            return { success: true };
+          },
+          onMessage: { addListener: () => {} },
+        },
+      };
+      window.fetch = async () => new Response("[]", { status: 200, headers: { "Content-Type": "application/json" } });
+    </script>
+  </head>
+  <body>
+    <div class="topbar"></div>
+    <div class="nav"></div>
+    <main>
+      <p class="section-label">SYLLABUS</p>
+      <div class="shell">
+        <div class="term">Term <select aria-label="Term"><option>SEM-III</option></select></div>
+        <div class="tabs">
+          <div class="tab">Courses</div><div class="tab">Schedule</div><div class="tab active">Attendance</div>
+          <div class="tab">Marks</div><div class="tab">Assessment</div><div class="tab">Shared Contents</div>
+        </div>
+        <div class="attendance">
+          <table>
+            <thead><tr><th>Sr. No.</th><th>Course Code</th><th>Course Name</th><th>Faculty Name</th><th>Present Count</th><th>Absent Count</th><th>Total Count</th><th>Percentage</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>Activity and Remedial Class</td><td>Activity and Remedial Class</td><td>Ms.Gourav Shelly</td><td>2</td><td>0</td><td>2</td><td>100.00</td></tr>
+              <tr><td>2</td><td>CCSAI0301</td><td>Artificial Intelligence</td><td>Mr.Amit Kumar Yadav</td><td>7</td><td>1</td><td>8</td><td>87.50</td></tr>
+              <tr><td>3</td><td>CNC0301</td><td>Artificial Intelligence and Cyber Ethics</td><td>Ms.Gourav Shelly</td><td>2</td><td>0</td><td>2</td><td>100.00</td></tr>
+              <tr><td>4</td><td>CCSAI0351</td><td>Artificial Intelligence lab</td><td>Mr.Amit Kumar Yadav</td><td>2</td><td>2</td><td>4</td><td>50.00</td></tr>
+              <tr><td>5</td><td>CCSE0304</td><td>Computer Architecture &amp; Parallel Processing</td><td>Pooja Kumari</td><td>4</td><td>0</td><td>4</td><td>100.00</td></tr>
+              <tr><td>6</td><td>CCSE0301</td><td>Data Structures and Algorithm-II</td><td>Mr.Keshav Kumar Sharma</td><td>3</td><td>0</td><td>3</td><td>100.00</td></tr>
+              <tr><td>7</td><td>CCSE0351</td><td>Data Structures and Algorithm-II Lab</td><td>Mr.Keshav Kumar Sharma</td><td>0</td><td>0</td><td>0</td><td>0.00</td></tr>
+              <tr><td>8</td><td>CCSCC0301</td><td>Employability Skill Development-I</td><td>Mohit Kumar</td><td>36</td><td>4</td><td>40</td><td>90.00</td></tr>
+              <tr><td>9</td><td>CCSE359</td><td>Internship-I</td><td>Ms.Gourav Shelly</td><td>4</td><td>2</td><td>6</td><td>66.67</td></tr>
+              <tr><td>10</td><td>CCSE0355</td><td>Object Oriented Techniques using Java</td><td>Mr.Suraj Kumar</td><td>68</td><td>8</td><td>76</td><td>89.47</td></tr>
+              <tr><td>11</td><td>CCSE0303A</td><td>Operating Systems</td><td>Ms.Ayushi Gupta</td><td>5</td><td>1</td><td>6</td><td>83.33</td></tr>
+              <tr><td>12</td><td>CCSE0353A</td><td>Operating Systems Lab</td><td>Ms.Ayushi Gupta</td><td>0</td><td>0</td><td>0</td><td>0.00</td></tr>
+              <tr><td>13</td><td>CASL0301</td><td>Technical Communication</td><td>Dr. Apeksha</td><td>0</td><td>0</td><td>0</td><td>0.00</td></tr>
+            </tbody>
+            <tfoot><tr><td colspan="4"></td><td>133</td><td>18</td><td>151</td><td>88.08</td></tr></tfoot>
+          </table>
+        </div>
+      </div>
+    </main>
+    <script src="../dist/content/content.js"></script>
+  </body>
+</html>

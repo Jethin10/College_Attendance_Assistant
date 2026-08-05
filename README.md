@@ -9,24 +9,26 @@ Everything stays on your device. No server, no account, no analytics.
 
 ## Which rule it applies
 
-The verdict is based on your **overall** attendance — the same figure the ERP
-shows and the one the institute enforces in practice. If the extension and the
-portal ever disagree, that is a bug.
-
-The signed [Attendance Policy 2025-26](attendance_policy_2025_26.pdf) §1 also
-asks for 75% in *each* subject individually:
+The planner uses NIET's current published
+[Attendance Policy 2025-26](attendance_policy_2025_26.pdf) §1 as a planning
+reference. It sets 75% in *each* theory and practical subject individually:
 
 > Every student must maintain a minimum of 75% attendance in each theory and
 > practical subject individually.
 
-That clause is not currently enforced, so the extension does not treat it as a
-verdict — telling you "not safe" while the institute considers you fine would
-be worse than useless. A subject below 75% is instead shown as a quiet note, so
-you know about it without it overriding your actual standing.
+The ERP's aggregate percentage is still displayed as a cross-check, but a high
+overall figure does not hide a subject below the published target. Simulations
+show both the overall before/after change and the affected subject-level margin.
+The extension does not label a student eligible or ineligible for an exam:
+condonation, approved exceptions, and the institute's final decision are not
+visible from attendance counts alone.
 
-If enforcement changes, flipping `enforcePerSubject` in
-`src/lib/storage.ts` switches every calculation back to weakest-subject
-behaviour. That path is covered by tests.
+The policy page was cross-checked on 5 August 2026. NIET's public policy index
+still lists the 2025-26 document and does not list a newer attendance policy.
+The ERP remains authoritative for the actual attendance counts.
+
+See [ATTENDANCE_RULES.md](ATTENDANCE_RULES.md) for the source comparison,
+formulae, and limits of what the extension can predict.
 
 ---
 
@@ -107,8 +109,8 @@ Tests are bundled with esbuild (so the `@/` alias resolves) and run under
 node's built-in test runner. No test framework dependency.
 
 The most important tests are `missed classes are attributed to the subject that
-owns them` (guards the session/subject id reconciliation) and `per-subject mode
-still works when the clause is enforced` (guards the policy escape hatch).
+owns them` (guards the session/subject id reconciliation), the subject-policy
+verdict tests, and the schedule-independent individual-class simulation test.
 
 ---
 

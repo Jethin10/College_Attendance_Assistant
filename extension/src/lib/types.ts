@@ -6,6 +6,8 @@ export type SimulationMode =
   | "future-count"
   | "leave-days";
 
+export type LeaveDayPart = "full" | "morning" | "afternoon";
+
 export type RiskStatus = "safe" | "warning" | "critical";
 
 export interface Subject {
@@ -53,8 +55,8 @@ export interface TimetableSyncState {
 
 export interface AttendancePolicy {
   /**
-   * Minimum attendance percentage. Applied to the OVERALL figure, which is
-   * what NIET currently enforces in practice.
+   * Minimum attendance percentage. NIET's current 2025-26 policy applies it
+   * to each theory and practical subject individually.
    */
   thresholdPercent: number;
   /** Floor below which severe-medical condonation cannot be granted. */
@@ -63,11 +65,8 @@ export interface AttendancePolicy {
    * When true, the verdict is driven by the weakest subject rather than the
    * overall figure.
    *
-   * The signed Attendance Policy 2025-26 (section 1) requires 75% in each
-   * subject individually, but that clause is not being enforced — only the
-   * overall percentage is. The extension therefore reports on overall by
-   * default and keeps per-subject shortfalls as an advisory note, so students
-   * are not told they are unsafe when the institute considers them fine.
+   * The aggregate percentage is still shown because it is the figure exposed
+   * by the ERP summary, but it must not hide a subject below the requirement.
    */
   enforcePerSubject: boolean;
 }
@@ -110,6 +109,7 @@ export interface SimulationRequest {
   slotId?: string;
   futureClasses?: number;
   leaveDays?: number;
+  dayPart?: LeaveDayPart;
   fromDate?: string;
   toDate?: string;
 }
@@ -148,16 +148,21 @@ export interface SimulationResult {
     /** True when the synced schedule ends before recovery is achievable. */
     recoveryBeyondSchedule: boolean;
     safeLeaveDaysRemaining: number;
-    /** Status of the overall percentage after the simulated absence. */
+    /** Policy verdict after the simulated absence. */
     status: RiskStatus;
-    /** Weakest subject after the absence, as advisory context. */
+    /** Weakest subject after the absence. */
     weakestSubjectName?: string;
     weakestSubjectPercent?: number;
   };
   summary: {
     impactedSubjects: number;
     classesMissed: number;
+    /** Impacted subjects below the threshold after the simulation. */
     thresholdBreaches: number;
+    /** All started subjects below the threshold after the simulation. */
+    subjectsBelowThreshold: number;
+    /** Subjects that cross from compliant to below-threshold in this simulation. */
+    newThresholdBreaches: number;
   };
 }
 
@@ -205,7 +210,7 @@ export interface DashboardData {
   overall: {
     attendedClasses: number;
     heldClasses: number;
-    /** Aggregate percentage — the figure NIET enforces and the ERP displays. */
+    /** Aggregate percentage displayed by the ERP. */
     attendancePercent: number;
     nextMissDropPercent: number;
     /** Classes that can be missed while overall stays at or above the threshold. */
@@ -213,11 +218,10 @@ export interface DashboardData {
     safeLeaveDays: number;
     /** Classes needed to bring overall back to the threshold. */
     recoveryClassesNeeded: number;
-    /** Status of the overall percentage. */
+    /** Policy verdict, using the weakest started subject when required. */
     status: RiskStatus;
     /**
-     * Weakest subject, surfaced as advisory context rather than as the verdict.
-     * Present whenever at least one subject has started.
+     * Weakest subject. Present whenever at least one subject has started.
      */
     weakestSubjectId?: string;
     weakestSubjectName?: string;

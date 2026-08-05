@@ -1,149 +1,462 @@
 /* ==========================================================================
-   Attendance Planner — on-page overlay
+   NIET attendance page enhancement
 
-   Injected into the NIET ERP, which is a light-themed portal. This deliberately
-   uses a light surface and the portal's own font metrics so it reads as part of
-   the page rather than a foreign widget pasted on top.
+   The planner deliberately borrows the portal's compact typography, white
+   surface, blue controls, and table-like dividers. It is a page section, not a
+   branded extension card.
    ========================================================================== */
 
 [data-niet-planner] {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text",
-               "Segoe UI", system-ui, Roboto, Arial, sans-serif;
+  box-sizing: border-box;
+  font-family: Arial, "Helvetica Neue", sans-serif;
   -webkit-font-smoothing: antialiased;
+}
+
+[data-niet-planner] *,
+[data-niet-planner] *::before,
+[data-niet-planner] *::after {
   box-sizing: border-box;
 }
 
-[data-niet-planner] *, [data-niet-planner] *::before, [data-niet-planner] *::after {
-  box-sizing: border-box;
+.niet-leave-planner {
+  display: grid;
+  grid-template-columns: minmax(610px, 1.5fr) minmax(355px, .86fr) auto;
+  align-items: stretch;
+  min-height: 126px;
+  margin: 0;
+  padding: 18px 18px 16px;
+  background: #fff;
+  border: 0;
+  border-bottom: 1px solid #dce4eb;
+  color: #202a35;
 }
 
-/* ------------------------- Summary bar ------------------------- */
-.niet-planner-summary {
-  margin: 0 0 12px;
-  padding: 10px 12px;
-  background: #ffffff;
-  border: 1px solid rgba(0, 0, 0, .10);
-  border-left: 3px solid #2f6be0;
-  border-radius: 8px;
-  color: #1c1c1e;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, .04);
+.niet-leave-planner__primary {
+  min-width: 0;
+  padding-right: 30px;
 }
 
-.niet-planner-summary__inner {
+.niet-leave-planner__heading-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.niet-leave-planner__title,
+.niet-leave-planner__caption,
+.niet-leave-planner__current,
+.niet-leave-planner__result p {
+  margin: 0;
+}
+
+.niet-leave-planner__title {
+  color: #17212b;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.niet-leave-planner__caption,
+.niet-leave-planner__current,
+.niet-leave-planner__result-detail {
+  color: #65717d;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+.niet-leave-planner__caption {
+  margin-top: 3px;
+}
+
+.niet-leave-planner__current {
+  padding-top: 2px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.niet-leave-planner__controls {
+  margin-top: 13px;
+}
+
+.niet-leave-planner__day-controls,
+.niet-leave-planner__class-controls {
   display: flex;
   align-items: center;
-  gap: 16px;
-  flex-wrap: wrap;
+  gap: 18px;
 }
 
-.niet-planner-summary__brand {
+.niet-leave-planner__class-controls[hidden],
+.niet-leave-planner__day-controls[hidden] {
+  display: none !important;
+}
+
+.niet-leave-planner button,
+.niet-leave-planner input,
+.niet-leave-planner select {
+  font: inherit;
+}
+
+.niet-leave-planner__toggle {
+  display: inline-flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+  height: 34px;
+  overflow: hidden;
+  background: #fff;
+  border: 1px solid #c9d4de;
+  border-radius: 4px;
+}
+
+.niet-leave-planner__toggle-button {
+  min-width: 70px;
+  height: 32px;
+  margin: 0;
+  padding: 0 13px;
+  border: 0;
+  border-right: 1px solid #d4dde5;
+  border-radius: 0;
+  background: #fff;
+  color: #27313b;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 32px;
+  cursor: pointer;
+}
+
+.niet-leave-planner__toggle-button:last-child {
+  border-right: 0;
+}
+
+.niet-leave-planner__toggle-button.is-active {
+  background: #0796d8;
+  color: #fff;
+  font-weight: 600;
+}
+
+.niet-leave-planner__date {
+  position: relative;
+  display: block;
+  flex: 0 1 210px;
+  min-width: 170px;
+  height: 34px;
+  overflow: hidden;
+  background: #fff;
+  border: 1px solid #c9d4de;
+  border-radius: 4px;
+}
+
+.niet-leave-planner__date input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  cursor: pointer;
+}
+
+.niet-leave-planner__date input::-webkit-datetime-edit {
+  opacity: 0;
+}
+
+.niet-leave-planner__date input::-webkit-calendar-picker-indicator {
+  position: absolute;
+  right: 10px;
+  opacity: .55;
+  cursor: pointer;
+}
+
+.niet-leave-planner__date-text {
+  position: absolute;
+  top: 50%;
+  left: 14px;
+  z-index: 1;
+  color: #33404c;
+  font-size: 12px;
+  line-height: 1;
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.niet-leave-planner__select,
+.niet-leave-planner__subject-select,
+.niet-leave-planner__count {
+  height: 34px;
+  margin: 0;
+  padding: 0 34px 0 12px;
+  border: 1px solid #c9d4de;
+  border-radius: 4px;
+  background-color: #fff;
+  color: #33404c;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.niet-leave-planner__count {
+  display: inline-flex;
+  flex: 0 0 120px;
+  align-items: center;
+  overflow: hidden;
+  cursor: text;
+}
+
+.niet-leave-planner__count input {
+  width: 52px;
+  height: 32px;
+  margin: 0;
+  padding: 0 2px 0 12px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #33404c;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.niet-leave-planner__count input::-webkit-inner-spin-button,
+.niet-leave-planner__count input::-webkit-outer-spin-button {
+  margin: 0;
+  opacity: .55;
+}
+
+.niet-leave-planner__count-unit {
+  min-width: 42px;
+  color: #65717d;
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.niet-leave-planner__count[hidden],
+.niet-leave-planner__select[hidden] {
+  display: none !important;
+}
+
+.niet-leave-planner__select {
+  flex: 0 0 120px;
+}
+
+.niet-leave-planner__subject-select {
+  flex: 1 1 320px;
+  min-width: 220px;
+}
+
+.niet-leave-planner__check {
+  flex: 0 0 auto;
+  min-width: 110px;
+  height: 34px;
+  margin: 0;
+  padding: 0 16px;
+  border: 1px solid #0875b4;
+  border-radius: 3px;
+  background: #087fbe;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 32px;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.niet-leave-planner__check:hover:not(:disabled) {
+  border-color: #076ca4;
+  background: #0878b4;
+  box-shadow: 0 1px 2px rgba(0, 82, 125, .18);
+}
+
+.niet-leave-planner__check:active:not(:disabled) {
+  border-color: #066396;
+  background: #0772aa;
+  box-shadow: none;
+}
+
+.niet-leave-planner__check:disabled {
+  cursor: wait;
+  opacity: .68;
+}
+
+.niet-leave-planner__result {
   display: flex;
+  min-width: 0;
+  padding: 1px 26px 0 20px;
   flex-direction: column;
-  min-width: 130px;
+  justify-content: center;
+  border-left: 1px solid #dce4eb;
+  font-variant-numeric: tabular-nums;
 }
 
-.niet-planner-summary__logo {
-  color: #1c1c1e;
+.niet-leave-planner__result-label {
+  color: #65717d;
   font-size: 12px;
   font-weight: 600;
   line-height: 1.3;
 }
 
-.niet-planner-summary__caption {
-  color: #8e8e93;
-  font-size: 10.5px;
+.niet-leave-planner__comparison {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 3px;
+  white-space: nowrap;
+}
+
+.niet-leave-planner__before {
+  color: #6c7781;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.niet-leave-planner__arrow {
+  color: #8b969f;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.niet-leave-planner__after {
+  color: #17212b;
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.niet-leave-planner__delta {
+  margin-top: 2px !important;
+  color: #65717d;
+  font-size: 11px;
+  font-weight: 400;
   line-height: 1.3;
 }
 
-.niet-planner-summary__stats {
-  display: flex;
-  align-items: center;
-  gap: 18px;
-  flex-wrap: wrap;
-  flex: 1;
+.niet-leave-planner__result-detail {
+  margin-top: 4px !important;
 }
 
-.niet-planner-summary__stat {
-  display: inline-flex;
-  flex-direction: column;
-  gap: 1px;
-  color: #6a6a70;
-  font-size: 10px;
-  font-weight: 500;
-  letter-spacing: .02em;
-  text-transform: uppercase;
-}
-
-.niet-planner-summary__stat strong {
-  color: #1c1c1e;
-  font-size: 16px;
+.niet-leave-planner__result-foot {
+  margin-top: 8px !important;
+  color: #6b7680;
+  font-size: 12px;
   font-weight: 600;
-  text-transform: none;
-  letter-spacing: -.01em;
-  font-variant-numeric: tabular-nums;
+  line-height: 1.3;
 }
 
-.niet-planner-summary__dismiss {
-  flex-shrink: 0;
-  width: 22px;
-  height: 22px;
-  padding: 0;
-  display: grid;
-  place-items: center;
-  border: none;
-  border-radius: 5px;
+.niet-leave-planner__result[data-state="safe"] .niet-leave-planner__result-foot {
+  color: #16875d;
+}
+
+.niet-leave-planner__result[data-state="warning"] .niet-leave-planner__result-foot {
+  color: #8a641f;
+}
+
+.niet-leave-planner__result[data-state="critical"] .niet-leave-planner__after,
+.niet-leave-planner__result[data-state="critical"] .niet-leave-planner__result-foot {
+  color: #a3433d;
+}
+
+.niet-leave-planner__result[data-state="loading"] {
+  opacity: .72;
+}
+
+.niet-leave-planner__class-link {
+  align-self: center;
+  justify-self: end;
+  margin: 0;
+  padding: 10px 0 10px 24px;
+  border: 0;
+  border-radius: 0;
   background: transparent;
-  color: #8e8e93;
-  font-size: 17px;
-  line-height: 1;
+  color: #006fb8;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.3;
+  text-decoration: underline;
   cursor: pointer;
-  transition: background .15s ease, color .15s ease;
-}
-.niet-planner-summary__dismiss:hover { background: #f0f0f2; color: #1c1c1e; }
-
-/* Status colours — !important is required to beat the portal's own
-   table styles, which set colours with high-specificity selectors. */
-.niet-planner-status--safe     { color: #1a7f4b !important; }
-.niet-planner-status--warning  { color: #a86400 !important; }
-.niet-planner-status--critical { color: #c02626 !important; }
-
-/* --------------------------- Row badges --------------------------- */
-.niet-planner-badge {
-  display: inline-block;
-  margin-left: 8px;
-  padding: 1px 7px;
-  border-radius: 99px;
-  font-size: 10px;
-  font-weight: 600;
-  line-height: 1.6;
   white-space: nowrap;
-  vertical-align: middle;
 }
 
-.niet-planner-badge--safe {
-  color: #1a7f4b;
-  background: #e8f5ee;
-  border: 1px solid rgba(26, 127, 75, .18);
+.niet-attendance-note {
+  display: inline;
+  margin-left: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 400;
+  line-height: inherit;
+  white-space: nowrap;
+  vertical-align: baseline;
 }
 
-.niet-planner-badge--warning {
-  color: #a86400;
-  background: #fdf2e2;
-  border: 1px solid rgba(168, 100, 0, .18);
+.niet-attendance-note--safe,
+.niet-attendance-note--neutral {
+  color: #616c76;
 }
 
-.niet-planner-badge--critical {
-  color: #c02626;
-  background: #fdeaea;
-  border: 1px solid rgba(192, 38, 38, .18);
+.niet-attendance-note--critical {
+  color: #8e4541;
 }
 
-.niet-planner-badge--neutral {
-  color: #6a6a70;
-  background: #f0f0f2;
-  border: 1px solid rgba(0, 0, 0, .08);
+.niet-leave-planner button:focus-visible,
+.niet-leave-planner input:focus-visible,
+.niet-leave-planner select:focus-visible,
+.niet-leave-planner__date:focus-within {
+  outline: 2px solid #087fbe;
+  outline-offset: 2px;
+}
+
+@media (max-width: 1280px) {
+  .niet-leave-planner {
+    grid-template-columns: minmax(540px, 1fr) minmax(285px, .65fr);
+    row-gap: 10px;
+  }
+
+  .niet-leave-planner__class-link {
+    grid-column: 1 / -1;
+    justify-self: start;
+    padding: 0;
+  }
+
+  .niet-leave-planner__day-controls,
+  .niet-leave-planner__class-controls {
+    gap: 10px;
+  }
+}
+
+@media (max-width: 900px) {
+  .niet-leave-planner {
+    grid-template-columns: 1fr;
+    padding: 16px;
+  }
+
+  .niet-leave-planner__primary {
+    padding-right: 0;
+  }
+
+  .niet-leave-planner__heading-row,
+  .niet-leave-planner__day-controls,
+  .niet-leave-planner__class-controls {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .niet-leave-planner__current {
+    width: 100%;
+  }
+
+  .niet-leave-planner__result {
+    min-height: 92px;
+    padding: 16px 0 0;
+    border-top: 1px solid #dce4eb;
+    border-left: 0;
+  }
 }
 
 @media print {
-  [data-niet-planner] { display: none !important; }
+  [data-niet-planner] {
+    display: none !important;
+  }
 }

@@ -11,7 +11,7 @@ NIET Attendance Planner
 ## Short description (132 char max)
 
 ```
-Know if you can safely miss a class. Reads your NIET ERP attendance and shows exactly how much margin you have left.
+See how a planned absence changes your NIET ERP attendance and your margin to the published 75% target.
 ```
 
 ## Category
@@ -26,13 +26,10 @@ question: can you afford to miss a class right now?
 
 WHAT IT TELLS YOU
 
-Your overall attendance is the figure the institute enforces, so that is what
-the verdict is based on — it will always agree with your ERP. On top of that it
-tells you how many classes you can still miss, how many full days off that is
-worth, and what a planned absence would cost you.
-
-Subjects that have fallen below 75% are flagged as a note, so you know about
-them without being told you are unsafe when your overall is fine.
+NIET's current published policy sets a 75% target in each theory and practical
+subject, so the planner checks every started subject. The extension also shows
+the overall ERP percentage, how many classes you can still miss, how many full
+days off that is worth, and what a planned absence would cost you.
 
 WHAT IT DOES
 
@@ -43,7 +40,7 @@ WHAT IT DOES
 • Plans leave: pick days off, a date range, or a number of classes, and see the
   effect on every subject before you commit
 • Shows a summary above your attendance table on the ERP (dismissible)
-• Badges the toolbar with your lowest subject percentage
+• Badges the toolbar with your overall ERP percentage
 
 PRIVACY
 
@@ -53,9 +50,10 @@ already signed in to. It works only on nietcloud.niet.co.in.
 
 IMPORTANT
 
-Figures are estimates for planning. Approved OD, medical condonation, and
-curricular exemptions are applied by your department and are not counted here.
-Always confirm against the ERP before making a decision that matters.
+Figures are estimates for planning, not exam-eligibility decisions. Approved
+OD, medical condonation, curricular exemptions, and institute decisions are
+not counted here. Always confirm against the ERP and NIET before making a
+decision that matters.
 
 This is a student-built tool.
 ```
@@ -65,8 +63,8 @@ This is a student-built tool.
 **Single purpose**
 
 ```
-Helps a NIET student understand their own class attendance and plan leave
-without dropping below the institute's 75% attendance requirement.
+Helps a NIET student understand their own attendance and preview how planned
+leave changes their margin against the institute's published 75% target.
 ```
 
 **Permission justifications**

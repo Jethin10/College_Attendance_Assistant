@@ -24,16 +24,16 @@ const MAX_SNAPSHOTS = 50;
 const MAX_SIMULATIONS = 25;
 
 /**
- * NIET Attendance Policy 2025-26: 75% required, 60% floor for condonation.
+ * NIET Attendance Policy 2025-26: published 75% planning standard, with a
+ * 60% floor described for exceptional severe-medical consideration.
  *
- * `enforcePerSubject` is false because only the overall percentage is being
- * enforced in practice, even though section 1 of the signed policy specifies
- * per-subject. Per-subject shortfalls still surface as an advisory note.
+ * Section 1 sets 75% in each theory and practical subject individually.
+ * The ERP aggregate remains useful context, but cannot override a low subject.
  */
 const DEFAULT_POLICY: AttendancePolicy = {
   thresholdPercent: 75,
   severeMedicalFloorPercent: 60,
-  enforcePerSubject: false,
+  enforcePerSubject: true,
 };
 
 function defaultStudent(): StudentProfile {
@@ -346,6 +346,21 @@ export async function saveSimulation(
 
   await writeStore(store);
   return result;
+}
+
+/** Runs an on-page projection without adding it to simulation history. */
+export async function previewSimulation(
+  request: SimulationRequest,
+): Promise<SimulationResult> {
+  const store = await readStore();
+
+  return simulateAttendance({
+    policy: store.policy,
+    subjects: store.subjects,
+    timetable: store.timetable,
+    calendarSessions: store.calendarSessions,
+    request,
+  });
 }
 
 function inferSubjectType(name: string): Subject["type"] {

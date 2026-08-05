@@ -1,12 +1,13 @@
 /**
  * Background service worker — message router and action-badge owner.
  *
- * The badge shows overall attendance, matching what the institute enforces and
- * what the ERP displays, so the two never disagree at a glance.
+ * The badge shows the ERP aggregate for a quick cross-check. Planner verdicts
+ * still compare against NIET's current published per-subject target.
  */
 
 import {
   getDashboardData,
+  previewSimulation,
   readStore,
   replaceSubjects,
   replaceTimetable,
@@ -588,6 +589,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
     case "RUN_SIMULATION": {
       saveSimulation(payload as SimulationRequest)
+        .then((result) => sendResponse({ success: true, result }))
+        .catch((error) => sendResponse({ success: false, error: String(error) }));
+      return true;
+    }
+
+    case "PREVIEW_SIMULATION": {
+      previewSimulation(payload as SimulationRequest)
         .then((result) => sendResponse({ success: true, result }))
         .catch((error) => sendResponse({ success: false, error: String(error) }));
       return true;

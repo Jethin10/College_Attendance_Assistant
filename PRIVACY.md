@@ -52,11 +52,12 @@ in general, or any other website.
 
 ## Accuracy
 
-Figures shown are estimates calculated from what the ERP reports, and are
-provided for planning only. They are based on overall attendance, which is what
-the institute enforces. Approved OD, medical condonation, and similar
-adjustments are not counted. The ERP remains the authoritative record — always
-confirm there before making a decision that matters.
+Figures shown are estimates calculated from the ERP's present and total counts
+and are provided for planning only. The planner compares subject-level and
+aggregate attendance with NIET's published 75% target, but it does not decide
+exam eligibility. Approved OD, condonation, exceptions, and similar adjustments
+are not counted. NIET and the ERP remain authoritative — always confirm there
+before making a decision that matters.
 
 ## Changes
 
