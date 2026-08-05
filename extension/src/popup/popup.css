@@ -195,10 +195,7 @@ button, input, select, textarea {
 }
 
 
-/* ------------------- Weak-subject advisory ------------------- */
-/* Deliberately quiet. The institute enforces the overall figure, so a low
-   subject is information, not an alarm — styling it like a warning would
-   contradict the verdict directly above it. */
+/* ------------------- Weak-subject context ------------------- */
 .weak-note {
   display: flex;
   flex-direction: column;

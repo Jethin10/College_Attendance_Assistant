@@ -30,11 +30,11 @@ import type {
 const POLICY: AttendancePolicy = {
   thresholdPercent: 75,
   severeMedicalFloorPercent: 60,
-  enforcePerSubject: false,
+  enforcePerSubject: true,
 };
 
-/** Policy variant for when the per-subject clause is enforced again. */
-const PER_SUBJECT_POLICY: AttendancePolicy = { ...POLICY, enforcePerSubject: true };
+/** Legacy aggregate mode remains supported for comparison and migration tests. */
+const OVERALL_POLICY: AttendancePolicy = { ...POLICY, enforcePerSubject: false };
 
 const STUDENT: StudentProfile = {
   institute: "NIET Greater Noida",
@@ -146,13 +146,12 @@ test("getSubjectStatus separates critical, warning and safe", () => {
 
 /* --------------------------- the policy rule --------------------------- */
 
-test("a failing subject does not override a healthy overall figure", () => {
-  // Aggregate: 155/200 = 77.5%, which is what the institute enforces.
-  // Maths alone is at 68%, but that clause is not currently enforced.
+test("aggregate mode can report a healthy overall figure", () => {
+  // Aggregate: 155/200 = 77.5%, while Maths alone is at 68%.
   const data = dashboard([
     subject({ id: "maths", name: "Maths", attendedClasses: 68, heldClasses: 100 }),
     subject({ id: "dsa", name: "DSA", attendedClasses: 87, heldClasses: 100 }),
-  ]);
+  ], { policy: OVERALL_POLICY });
 
   assert.equal(data.overall.attendancePercent, 77.5);
   // 77.5% is above the line but inside the 5-point warning band.
@@ -164,11 +163,11 @@ test("a failing subject does not override a healthy overall figure", () => {
   assert.equal(data.insights.belowThresholdCount, 1);
 });
 
-test("safeToMissClasses uses the overall pool", () => {
+test("aggregate mode safeToMissClasses uses the overall pool", () => {
   const data = dashboard([
     subject({ id: "a", name: "A", attendedClasses: 76, heldClasses: 100 }),
     subject({ id: "b", name: "B", attendedClasses: 95, heldClasses: 100 }),
-  ]);
+  ], { policy: OVERALL_POLICY });
 
   // 171/200 = 85.5%; the pooled allowance is what matters now.
   assert.equal(data.overall.safeToMissClasses, computeBunkableClasses(171, 200, 75));
@@ -187,15 +186,13 @@ test("overall below the threshold reports critical", () => {
   assert.equal(data.overall.recoveryClassesNeeded, computeRecoveryClassesNeeded(130, 200, 75));
 });
 
-test("per-subject mode still works when the clause is enforced", () => {
-  // Guards the escape hatch: if NIET enforces section 1 again, flipping this
-  // one flag must restore weakest-subject behaviour.
+test("current policy makes a failing subject override a healthy aggregate", () => {
   const data = dashboard(
     [
       subject({ id: "maths", name: "Maths", attendedClasses: 68, heldClasses: 100 }),
       subject({ id: "dsa", name: "DSA", attendedClasses: 87, heldClasses: 100 }),
     ],
-    { policy: PER_SUBJECT_POLICY },
+    { policy: POLICY },
   );
 
   assert.equal(data.overall.status, "critical");
@@ -222,7 +219,7 @@ test("an empty subject list reports safe rather than crashing", () => {
 
 /* ---------------------------- safe leave days ---------------------------- */
 
-test("leave days draw on one shared pool in overall mode", () => {
+test("leave days draw on one shared pool in aggregate mode", () => {
   // 166/200 = 83%; pooled allowance covers several days regardless of which
   // subject each class belongs to.
   const subjects = [
@@ -236,7 +233,7 @@ test("leave days draw on one shared pool in overall mode", () => {
     session("s3", "dsa", "2099-01-05", "14:00"),
   ];
 
-  const data = dashboard(subjects, { calendarSessions });
+  const data = dashboard(subjects, { calendarSessions, policy: OVERALL_POLICY });
 
   assert.equal(data.overall.safeToMissClasses, computeBunkableClasses(166, 200, 75));
   assert.equal(data.overall.safeLeaveDays, 1, "3 classes fit inside the pooled budget");
@@ -251,6 +248,7 @@ test("a day is refused once the shared pool runs out", () => {
 
   const data = dashboard(subjects, {
     calendarSessions: [session("s1", "maths", "2099-01-05", "09:00")],
+    policy: OVERALL_POLICY,
   });
 
   assert.equal(data.overall.safeToMissClasses, 0);
@@ -273,7 +271,7 @@ test("per-subject mode gives each subject its own leave budget", () => {
 
   assert.equal(computeBunkableClasses(76, 100, 75), 1);
 
-  const data = dashboard(subjects, { calendarSessions, policy: PER_SUBJECT_POLICY });
+  const data = dashboard(subjects, { calendarSessions, policy: POLICY });
   assert.equal(data.overall.safeLeaveDays, 0, "two Maths classes exceed its budget of 1");
 });
 
@@ -301,14 +299,14 @@ test("missing classes raises held without raising attended", () => {
   assert.equal(result.projections[0].afterPercent, computeAttendancePercent(80, 102));
 });
 
-test("simulation status follows the overall figure", () => {
+test("aggregate simulation status follows the overall figure", () => {
   const subjects = [
     subject({ id: "maths", name: "Maths", attendedClasses: 76, heldClasses: 100 }),
     subject({ id: "dsa", name: "DSA", attendedClasses: 99, heldClasses: 100 }),
   ];
 
   const result = simulateAttendance({
-    policy: POLICY,
+    policy: OVERALL_POLICY,
     subjects,
     timetable: [],
     calendarSessions: [
@@ -324,6 +322,56 @@ test("simulation status follows the overall figure", () => {
   assert.equal(result.overall.weakestSubjectName, "Maths");
   // Per-subject detail is still computed for the breakdown list.
   assert.equal(result.summary.thresholdBreaches, 1);
+  assert.equal(result.summary.subjectsBelowThreshold, 1);
+  assert.equal(result.summary.newThresholdBreaches, 1);
+});
+
+test("individual class planning works without a matching timetable slot", () => {
+  const result = simulateAttendance({
+    policy: POLICY,
+    subjects: [
+      subject({
+        id: "remedial",
+        name: "Activity and Remedial Class",
+        attendedClasses: 2,
+        heldClasses: 2,
+      }),
+    ],
+    timetable: [],
+    calendarSessions: [],
+    request: { mode: "future-count", subjectId: "remedial", futureClasses: 7 },
+  });
+
+  assert.equal(result.overall.classesMissed, 7);
+  assert.equal(result.impactedSlots.length, 7);
+  assert.equal(result.projections[0].beforePercent, 100);
+  assert.equal(result.projections[0].afterPercent, computeAttendancePercent(2, 9));
+  assert.equal(result.summary.newThresholdBreaches, 1);
+});
+
+test("leave planning supports a custom duration beyond the old preset list", () => {
+  const result = simulateAttendance({
+    policy: POLICY,
+    subjects: [subject({ id: "maths", attendedClasses: 50, heldClasses: 50 })],
+    timetable: [
+      {
+        id: "maths-monday",
+        subjectId: "maths",
+        dayOfWeek: 1,
+        startTime: "09:00",
+        endTime: "10:00",
+      },
+    ],
+    calendarSessions: [],
+    request: {
+      mode: "leave-days",
+      leaveDays: 12,
+      dayPart: "full",
+      fromDate: "2099-01-01",
+    },
+  });
+
+  assert.equal(result.overall.classesMissed, 12);
 });
 
 test("simulation reports critical once overall drops below the threshold", () => {
@@ -396,6 +444,50 @@ test("date ranges are parsed in local time", () => {
   });
 
   assert.equal(result.overall.classesMissed, 1);
+});
+
+test("half-day leave only counts sessions in the selected part of the day", () => {
+  const subjects = [
+    subject({ id: "maths", name: "Maths", attendedClasses: 40, heldClasses: 50 }),
+    subject({ id: "dsa", name: "DSA", attendedClasses: 40, heldClasses: 50 }),
+  ];
+
+  const calendarSessions = [
+    session("morning-1", "maths", "2099-08-06", "09:00"),
+    session("morning-2", "dsa", "2099-08-06", "11:00"),
+    session("afternoon-1", "maths", "2099-08-06", "13:00"),
+  ];
+
+  const morning = simulateAttendance({
+    policy: POLICY,
+    subjects,
+    timetable: [],
+    calendarSessions,
+    request: {
+      mode: "leave-days",
+      leaveDays: 1,
+      dayPart: "morning",
+      fromDate: "2099-08-06",
+    },
+  });
+
+  const afternoon = simulateAttendance({
+    policy: POLICY,
+    subjects,
+    timetable: [],
+    calendarSessions,
+    request: {
+      mode: "leave-days",
+      leaveDays: 1,
+      dayPart: "afternoon",
+      fromDate: "2099-08-06",
+    },
+  });
+
+  assert.equal(morning.overall.classesMissed, 2);
+  assert.equal(morning.summary.impactedSubjects, 2);
+  assert.equal(afternoon.overall.classesMissed, 1);
+  assert.equal(afternoon.summary.impactedSubjects, 1);
 });
 
 test("recovery beyond the synced schedule is flagged, not silently rounded", () => {
