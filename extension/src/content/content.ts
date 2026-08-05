@@ -96,12 +96,14 @@ type PlannerSimulationResult = {
     beforePercent: number;
     afterPercent: number;
     deltaPercent: number;
+    classesAssumedAttended: number;
     classesMissed: number;
     recoveryClassesNeeded: number;
     status: "safe" | "warning" | "critical";
   };
   summary: {
     impactedSubjects: number;
+    classesAssumedAttended: number;
     classesMissed: number;
     thresholdBreaches: number;
     subjectsBelowThreshold: number;
@@ -819,12 +821,7 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
   );
   headingCopy.append(title, caption);
 
-  const current = plannerElement(
-    "p",
-    "niet-leave-planner__current",
-    `Current attendance ${dashboard.overall.attendancePercent}% · ${dashboard.overall.attendedClasses} of ${dashboard.overall.heldClasses} classes`,
-  );
-  headingRow.append(headingCopy, current);
+  headingRow.append(headingCopy);
 
   const controls = plannerElement("div", "niet-leave-planner__controls");
   const leaveToggle = plannerElement("div", "niet-leave-planner__toggle");
@@ -851,6 +848,7 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
   const dateInput = document.createElement("input");
   dateInput.type = "date";
   dateInput.setAttribute("aria-label", "Leave starting date");
+  dateInput.min = toDateKey(new Date());
   dateInput.value = nextScheduledDate(dashboard);
   const dateText = plannerElement(
     "span",
@@ -921,11 +919,11 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
 
   const result = plannerElement("div", "niet-leave-planner__result");
   result.setAttribute("aria-live", "polite");
-  result.dataset.state = "loading";
+  result.dataset.state = "idle";
   const resultLabel = plannerElement(
     "p",
     "niet-leave-planner__result-label",
-    "Projected overall attendance",
+    "Current attendance",
   );
   const resultComparison = plannerElement("div", "niet-leave-planner__comparison");
   const resultBefore = plannerElement(
@@ -941,6 +939,8 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
     `${dashboard.overall.attendancePercent}%`,
   );
   resultComparison.append(resultBefore, resultArrow, resultAfter);
+  const resultSummary = plannerElement("div", "niet-leave-planner__result-summary");
+  resultSummary.append(resultLabel, resultComparison);
   const resultDelta = plannerElement(
     "p",
     "niet-leave-planner__delta",
@@ -949,10 +949,19 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
   const resultDetail = plannerElement(
     "p",
     "niet-leave-planner__result-detail",
-    "Calculating the classes affected…",
+    "",
   );
-  const resultFoot = plannerElement("p", "niet-leave-planner__result-foot", "");
-  result.append(resultLabel, resultComparison, resultDelta, resultDetail, resultFoot);
+  const resultMeta = plannerElement("div", "niet-leave-planner__result-meta");
+  resultMeta.append(resultDelta, resultDetail);
+  const resultFoot = plannerElement(
+    "p",
+    "niet-leave-planner__result-foot",
+    `${dashboard.overall.attendedClasses} of ${dashboard.overall.heldClasses} classes attended`,
+  );
+  resultBefore.hidden = true;
+  resultArrow.hidden = true;
+  resultMeta.hidden = true;
+  result.append(resultSummary, resultMeta, resultFoot);
 
   const classModeButton = plannerElement(
     "button",
@@ -1000,6 +1009,10 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
     const deltaPercent = subjectProjection?.deltaPercent ?? overall.deltaPercent;
     const status = subjectProjection?.status ?? overall.status;
 
+    resultBefore.hidden = false;
+    resultArrow.hidden = false;
+    resultComparison.hidden = false;
+    resultMeta.hidden = false;
     result.dataset.state = summary.classesMissed === 0 ? "neutral" : status;
     resultLabel.textContent = classMode
       ? (subjectProjection?.subjectName ?? "Selected subject")
@@ -1008,12 +1021,16 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
     resultAfter.textContent = `${afterPercent}%`;
     resultDelta.textContent = deltaPercent > 0
       ? `${deltaPercent} ${plural(deltaPercent, "point", "points")} lower`
-      : "No change";
+      : deltaPercent < 0
+        ? `${Math.abs(deltaPercent)} ${plural(Math.abs(deltaPercent), "point", "points")} higher`
+        : "No change";
 
     if (summary.classesMissed === 0) {
       resultLabel.textContent = "No classes scheduled";
-      resultDetail.textContent = "Your attendance stays unchanged.";
-      resultFoot.textContent = "No attendance impact";
+      resultDetail.textContent = summary.classesAssumedAttended > 0
+        ? `${summary.classesAssumedAttended} earlier ${plural(summary.classesAssumedAttended, "class", "classes")} assumed attended`
+        : "Your attendance stays unchanged.";
+      resultFoot.textContent = "No classes missed on the selected date";
       return;
     }
 
@@ -1028,7 +1045,10 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
       return;
     }
 
-    resultDetail.textContent = `${summary.classesMissed} ${plural(summary.classesMissed, "class", "classes")} across ${summary.impactedSubjects} ${plural(summary.impactedSubjects, "subject", "subjects")}`;
+    resultDetail.textContent = `${summary.classesMissed} ${plural(summary.classesMissed, "class", "classes")} missed across ${summary.impactedSubjects} ${plural(summary.impactedSubjects, "subject", "subjects")}`;
+    if (summary.classesAssumedAttended > 0) {
+      resultDetail.textContent += ` · ${summary.classesAssumedAttended} earlier ${plural(summary.classesAssumedAttended, "class", "classes")} assumed attended`;
+    }
     if (summary.subjectsBelowThreshold > 0) {
       resultFoot.textContent = summary.newThresholdBreaches > 0
         ? `${summary.newThresholdBreaches} new ${plural(summary.newThresholdBreaches, "subject", "subjects")} ${summary.newThresholdBreaches === 1 ? "falls" : "fall"} below the 75% target`
@@ -1039,6 +1059,10 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
   };
 
   const renderPreviewError = (message: string) => {
+    resultBefore.hidden = false;
+    resultArrow.hidden = false;
+    resultComparison.hidden = false;
+    resultMeta.hidden = false;
     result.dataset.state = "critical";
     resultLabel.textContent = "Could not check this leave";
     resultBefore.textContent = `${dashboard!.overall.attendancePercent}%`;
@@ -1046,6 +1070,20 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
     resultDelta.textContent = "Not calculated";
     resultDetail.textContent = message;
     resultFoot.textContent = "Try refreshing the attendance page";
+  };
+
+  const setResultIdle = () => {
+    result.dataset.state = "idle";
+    resultLabel.textContent = "Current attendance";
+    resultComparison.hidden = false;
+    resultBefore.hidden = true;
+    resultArrow.hidden = true;
+    resultMeta.hidden = true;
+    resultBefore.textContent = `${dashboard!.overall.attendancePercent}%`;
+    resultAfter.textContent = `${dashboard!.overall.attendancePercent}%`;
+    resultDelta.textContent = "No change";
+    resultDetail.textContent = "";
+    resultFoot.textContent = `${dashboard!.overall.attendedClasses} of ${dashboard!.overall.heldClasses} classes attended`;
   };
 
   const preview = async () => {
@@ -1062,6 +1100,10 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
     activeButton.disabled = true;
     activeButton.textContent = "Checking…";
     result.dataset.state = "loading";
+    resultLabel.textContent = "Checking impact…";
+    resultComparison.hidden = true;
+    resultMeta.hidden = true;
+    resultFoot.textContent = "Reading the affected classes.";
 
     const payload = classMode
       ? {
@@ -1113,28 +1155,33 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
 
   fullDayButton.addEventListener("click", () => {
     setLeaveLength("full");
-    void preview();
+    setResultIdle();
   });
   halfDayButton.addEventListener("click", () => {
     setLeaveLength("morning");
-    void preview();
+    setResultIdle();
   });
   durationInput.addEventListener("input", () => {
     durationInput.setCustomValidity("");
     syncCountUnit(durationInput, durationUnit, "day", "days");
+    setResultIdle();
   });
   classCountInput.addEventListener("input", () => {
     classCountInput.setCustomValidity("");
     syncCountUnit(classCountInput, classCountUnit, "class", "classes");
+    setResultIdle();
   });
   dayPartSelect.addEventListener("change", () => {
     dayPart = dayPartSelect.value === "afternoon" ? "afternoon" : "morning";
+    setResultIdle();
   });
   dateInput.addEventListener("change", () => {
     if (dateInput.value) {
       dateText.textContent = formatPlannerDate(dateInput.value);
     }
+    setResultIdle();
   });
+  subjectSelect.addEventListener("change", setResultIdle);
   checkButton.addEventListener("click", () => void preview());
   classCheckButton.addEventListener("click", () => void preview());
   classModeButton.addEventListener("click", () => {
@@ -1146,7 +1193,7 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
       ? "Check a subject before you miss class."
       : "Check the impact before you apply.";
     classModeButton.textContent = classMode ? "Back to day leave" : "Plan individual classes";
-    void preview();
+    setResultIdle();
   });
 
   const columns = getAttendanceColumns(attendanceTable);
@@ -1207,7 +1254,7 @@ async function injectAttendancePlanner(providedDashboard?: PlannerDashboard) {
     cells[cells.length - 1].appendChild(note);
   });
 
-  await preview();
+  setResultIdle();
 }
 
 async function sendAttendanceToServiceWorker(student: StudentContext) {

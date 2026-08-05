@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>NIET Attendance Planner QA</title>
-    <link rel="stylesheet" href="../dist/content/content.css" />
+    <link rel="stylesheet" href="../dist/content/content.css?v=chronological-leave" />
     <style>
       * { box-sizing: border-box; }
       body { margin: 0; background: #fff; color: #111; font-family: Arial, sans-serif; font-size: 12px; }
@@ -52,33 +52,61 @@
         recoveryClassesNeeded: recovery(subject.attendedClasses, subject.heldClasses),
         status: subject.heldClasses === 0 ? "not-started" : risk(percent(subject.attendedClasses, subject.heldClasses)),
       }));
-      const calendarSessions = [
+      const augustSixth = [
         ["remedial", "09:00"], ["ai", "10:00"], ["ai", "11:00"],
         ["ethics", "13:00"], ["architecture", "14:00"], ["dsa", "15:00"],
       ].map(([subjectId, startTime], index) => ({
-        id: `fixture-${index}`, subjectId, subjectCode: subjectId, subjectName: subjectId,
+        id: `fixture-06-${index}`, subjectId, subjectCode: subjectId, subjectName: subjectId,
         date: "2026-08-06", dayOfWeek: 4, startTime, endTime: startTime,
         source: "portal",
       }));
+      const augustSeventh = [
+        ["ailab", "09:00"], ["esd", "10:00"], ["java", "13:00"], ["os", "14:00"],
+      ].map(([subjectId, startTime], index) => ({
+        id: `fixture-07-${index}`, subjectId, subjectCode: subjectId, subjectName: subjectId,
+        date: "2026-08-07", dayOfWeek: 5, startTime, endTime: startTime,
+        source: "portal",
+      }));
+      const calendarSessions = [...augustSixth, ...augustSeventh];
       const dashboard = {
         overall: { attendedClasses: 133, heldClasses: 151, attendancePercent: 88.08 },
         subjects: dashboardSubjects,
         calendarSessions,
       };
+      window.__previewRequests = 0;
+
+      const addDays = (dateKey, count) => {
+        const [year, month, day] = dateKey.split("-").map(Number);
+        const date = new Date(year, month - 1, day);
+        date.setDate(date.getDate() + count);
+        return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+      };
 
       function simulate(request) {
         const missed = new Map();
+        const assumed = new Map();
         if (request.mode === "future-count") {
           missed.set(request.subjectId, Math.max(1, Math.floor(request.futureClasses || 1)));
         } else {
           const days = Math.max(1, Math.floor(request.leaveDays || 1));
-          const daySessions = request.dayPart === "morning"
-            ? calendarSessions.slice(0, 3)
-            : request.dayPart === "afternoon"
-              ? calendarSessions.slice(3)
-              : Array.from({ length: days }, () => calendarSessions).flat();
+          const startDate = request.fromDate || "2026-08-06";
+          const endDate = addDays(startDate, days - 1);
+          const scheduled = calendarSessions.filter((session) => session.date <= endDate);
+          const daySessions = scheduled.filter((session) => {
+            const onLeave = session.date >= startDate && session.date <= endDate;
+            if (!onLeave) return false;
+            if (request.dayPart === "morning") return session.startTime < "12:00";
+            if (request.dayPart === "afternoon") return session.startTime >= "12:00";
+            return true;
+          });
+          const missedIds = new Set(daySessions.map((session) => session.id));
           for (const session of daySessions) {
             missed.set(session.subjectId, (missed.get(session.subjectId) || 0) + 1);
+          }
+          for (const session of scheduled) {
+            if (!missedIds.has(session.id)) {
+              assumed.set(session.subjectId, (assumed.get(session.subjectId) || 0) + 1);
+            }
           }
         }
 
@@ -86,22 +114,30 @@
           .filter((subject) => missed.has(subject.id))
           .map((subject) => {
             const count = missed.get(subject.id);
+            const assumedCount = assumed.get(subject.id) || 0;
             const beforePercent = percent(subject.attendedClasses, subject.heldClasses);
-            const afterPercent = percent(subject.attendedClasses, subject.heldClasses + count);
+            const afterPercent = percent(
+              subject.attendedClasses + assumedCount,
+              subject.heldClasses + assumedCount + count,
+            );
             return {
               subjectId: subject.id,
               subjectName: subject.name,
               beforePercent,
               afterPercent,
               deltaPercent: round2(beforePercent - afterPercent),
-              recoveryClassesNeeded: recovery(subject.attendedClasses, subject.heldClasses + count),
+              recoveryClassesNeeded: recovery(
+                subject.attendedClasses + assumedCount,
+                subject.heldClasses + assumedCount + count,
+              ),
               status: risk(afterPercent),
             };
           });
         const classesMissed = [...missed.values()].reduce((sum, count) => sum + count, 0);
-        const afterPercent = round2(133 / (151 + classesMissed) * 100);
-        const afterSubjects = dashboardSubjects.filter((subject) => subject.heldClasses + (missed.get(subject.id) || 0) > 0);
-        const below = afterSubjects.filter((subject) => percent(subject.attendedClasses, subject.heldClasses + (missed.get(subject.id) || 0)) < threshold);
+        const classesAssumedAttended = [...assumed.values()].reduce((sum, count) => sum + count, 0);
+        const afterPercent = round2((133 + classesAssumedAttended) / (151 + classesAssumedAttended + classesMissed) * 100);
+        const afterSubjects = dashboardSubjects.filter((subject) => subject.heldClasses + (assumed.get(subject.id) || 0) + (missed.get(subject.id) || 0) > 0);
+        const below = afterSubjects.filter((subject) => percent(subject.attendedClasses + (assumed.get(subject.id) || 0), subject.heldClasses + (assumed.get(subject.id) || 0) + (missed.get(subject.id) || 0)) < threshold);
         const newlyBelow = below.filter((subject) => percent(subject.attendedClasses, subject.heldClasses) >= threshold);
         return {
           projections,
@@ -110,12 +146,14 @@
             beforePercent: 88.08,
             afterPercent,
             deltaPercent: round2(88.08 - afterPercent),
+            classesAssumedAttended,
             classesMissed,
             recoveryClassesNeeded: 0,
             status: below.length ? "critical" : risk(afterPercent),
           },
           summary: {
             impactedSubjects: projections.length,
+            classesAssumedAttended,
             classesMissed,
             thresholdBreaches: projections.filter((item) => item.afterPercent < threshold).length,
             subjectsBelowThreshold: below.length,
@@ -129,7 +167,10 @@
           sendMessage: async (message) => {
             if (message.type === "GET_PREFERENCES") return { success: true, preferences: { showPageOverlay: true } };
             if (message.type === "GET_DASHBOARD" || message.type === "ATTENDANCE_SCRAPED") return { success: true, dashboard };
-            if (message.type === "PREVIEW_SIMULATION") return { success: true, result: simulate(message.payload) };
+            if (message.type === "PREVIEW_SIMULATION") {
+              window.__previewRequests += 1;
+              return { success: true, result: simulate(message.payload) };
+            }
             return { success: true };
           },
           onMessage: { addListener: () => {} },
