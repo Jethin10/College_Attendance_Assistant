@@ -19,6 +19,7 @@ import {
   SubjectProjection,
   TimetableSyncState,
 } from "@/lib/types";
+import { dedupeCalendarSessions } from "@/lib/portal-timetable";
 
 /** Guard for schedule projections so a bad slot set cannot spin forever. */
 const PROJECTION_DAY_LIMIT = 180;
@@ -101,6 +102,7 @@ function makeSessionFromSlot(slot: ScheduleSlot, date: Date): CalendarSession {
     endTime: slot.endTime,
     room: slot.room,
     source: "manual",
+    estimated: true,
   };
 }
 
@@ -827,45 +829,103 @@ function requestedLeaveDates(startDate: Date, leaveDays: number) {
   return dateRange(startDate, endDate);
 }
 
-function scheduleCoverage(args: {
-  calendarSessions: CalendarSession[];
-  rangeStart?: string;
-  rangeEnd?: string;
-  referenceDate: Date;
-}) {
-  if (args.rangeStart && args.rangeEnd) {
-    return { start: args.rangeStart, end: args.rangeEnd };
-  }
-
-  const lastSession = latestCalendarSession(args.calendarSessions);
-  if (!lastSession) {
-    return null;
-  }
-
+function moveSessionToDate(
+  session: CalendarSession,
+  targetDate: Date,
+  inferredFromDate: string,
+): CalendarSession {
+  const date = toDateKey(targetDate);
   return {
-    start: toDateKey(startOfDay(args.referenceDate)),
-    end: lastSession.date,
+    ...session,
+    id: `estimated:${date}:${session.subjectId}:${session.startTime}:${session.endTime}`,
+    date,
+    dayOfWeek: targetDate.getDay(),
+    estimated: true,
+    inferredFromDate,
   };
+}
+
+/**
+ * Selects a single dated schedule for this weekday. Different weeks can carry
+ * different subjects, so combining them would create impossible overlapping
+ * classes. Prefer the nearest prior occurrence; only look forward when there
+ * is no historical example for that weekday.
+ */
+function weekdayTemplateForDate(
+  calendarSessions: CalendarSession[],
+  targetDate: Date,
+) {
+  const targetKey = toDateKey(targetDate);
+  const byDate = new Map<string, CalendarSession[]>();
+
+  for (const session of dedupeCalendarSessions(calendarSessions)) {
+    if (session.date === targetKey || session.dayOfWeek !== targetDate.getDay()) {
+      continue;
+    }
+    const group = byDate.get(session.date) ?? [];
+    group.push(session);
+    byDate.set(session.date, group);
+  }
+
+  const dates = [...byDate.keys()];
+  const priorDate = dates
+    .filter((date) => date < targetKey)
+    .sort((a, b) => b.localeCompare(a))[0];
+  const nextDate = dates
+    .filter((date) => date > targetKey)
+    .sort((a, b) => a.localeCompare(b))[0];
+  const templateDate = priorDate ?? nextDate;
+
+  return templateDate
+    ? (byDate.get(templateDate) ?? []).map((session) =>
+        moveSessionToDate(session, targetDate, templateDate),
+      )
+    : [];
+}
+
+function weeklySlotsForDate(timetable: ScheduleSlot[], targetDate: Date) {
+  const uniqueByPeriod = new Map<string, ScheduleSlot>();
+
+  for (const slot of sortSlotsByTime(timetable)) {
+    if (slot.dayOfWeek !== targetDate.getDay()) {
+      continue;
+    }
+    const periodKey = `${slot.startTime}|${slot.endTime}`;
+    if (!uniqueByPeriod.has(periodKey)) {
+      uniqueByPeriod.set(periodKey, slot);
+    }
+  }
+
+  return [...uniqueByPeriod.values()].map((slot) => makeSessionFromSlot(slot, targetDate));
 }
 
 function sessionsForDates(args: {
   timetable: ScheduleSlot[];
   calendarSessions: CalendarSession[];
   dates: Date[];
-  coverage: { start: string; end: string } | null;
 }) {
   return args.dates.flatMap((day) => {
     const dateKey = toDateKey(day);
-    const hasExactDate =
-      args.coverage && dateKey >= args.coverage.start && dateKey <= args.coverage.end;
+    const exactSessions = dedupeCalendarSessions(
+      args.calendarSessions.filter((session) => session.date === dateKey),
+    );
 
-    if (hasExactDate) {
-      return args.calendarSessions.filter((session) => session.date === dateKey);
+    // NIET's range endpoint is sparse: an empty future date often means that
+    // classes are not published yet, not that the day is a confirmed holiday.
+    // Exact rows win when present; otherwise use the recent recurring pattern.
+    if (exactSessions.length > 0) {
+      return exactSessions;
     }
 
-    return args.timetable
-      .filter((slot) => slot.dayOfWeek === day.getDay())
-      .map((slot) => makeSessionFromSlot(slot, day));
+    const datedTemplate = weekdayTemplateForDate(args.calendarSessions, day);
+    if (datedTemplate.length > 0) {
+      return datedTemplate;
+    }
+
+    // Manual or legacy stores may only contain a weekly timetable. Collapse
+    // conflicting rows by period so one student is never assigned two classes
+    // at the same time.
+    return weeklySlotsForDate(args.timetable, day);
   });
 }
 
@@ -874,7 +934,6 @@ function sessionsInWindow(args: {
   calendarSessions: CalendarSession[];
   from: Date;
   until: Date;
-  coverage: { start: string; end: string } | null;
 }) {
   if (args.until <= args.from) {
     return [];
@@ -885,7 +944,6 @@ function sessionsInWindow(args: {
     timetable: args.timetable,
     calendarSessions: args.calendarSessions,
     dates: dateRange(startOfDay(args.from), startOfDay(finalMoment)),
-    coverage: args.coverage,
   }).filter((session) => {
     const startsAt = sessionStartDate(session);
     return startsAt >= args.from && startsAt < args.until;
@@ -923,7 +981,6 @@ function impactedSlotsFromRequest(
   calendarSessions: CalendarSession[],
   request: SimulationRequest,
   referenceDate = new Date(),
-  coverage: { start: string; end: string } | null = null,
 ) {
   const hasExactSchedule = calendarSessions.length > 0;
 
@@ -997,7 +1054,6 @@ function impactedSlotsFromRequest(
       timetable,
       calendarSessions,
       dates: requestedLeaveDates(startDate, wantedDays),
-      coverage,
     }).filter(
       (session) =>
         sessionStartDate(session) >= referenceDate &&
@@ -1018,7 +1074,6 @@ function impactedSlotsFromRequest(
       parseDateKey(request.fromDate),
       parseDateKey(request.toDate),
     ),
-    coverage,
   }).filter(
     (session) =>
       sessionStartDate(session) >= referenceDate &&
@@ -1082,28 +1137,39 @@ export function simulateAttendance(args: {
 }): SimulationResult {
   const threshold = args.policy.thresholdPercent;
   const referenceDate = args.referenceDate ?? new Date();
-  const coverage = scheduleCoverage({
-    calendarSessions: args.calendarSessions,
-    rangeStart: args.scheduleRangeStart,
-    rangeEnd: args.scheduleRangeEnd,
-    referenceDate,
-  });
   const impactedSlots = impactedSlotsFromRequest(
     args.timetable,
     args.calendarSessions,
     args.request,
     referenceDate,
-    coverage,
   );
   const projectionEnd = leaveProjectionEnd(args.request);
+  const rangeStart = args.scheduleRangeStart
+    ? startOfDay(parseDateKey(args.scheduleRangeStart))
+    : null;
+  const rangeEndExclusive = args.scheduleRangeEnd
+    ? (() => {
+        const end = startOfDay(parseDateKey(args.scheduleRangeEnd));
+        end.setDate(end.getDate() + 1);
+        return end;
+      })()
+    : null;
+  const coveredFrom = rangeStart && rangeStart > referenceDate ? rangeStart : referenceDate;
+  const coveredUntil = projectionEnd && rangeEndExclusive && rangeEndExclusive < projectionEnd
+    ? rangeEndExclusive
+    : projectionEnd;
   const scheduledThroughProjection = projectionEnd
-    ? sessionsInWindow({
-        timetable: args.timetable,
-        calendarSessions: args.calendarSessions,
-        from: referenceDate,
-        until: projectionEnd,
-        coverage,
-      })
+    ? rangeStart && rangeEndExclusive && coveredUntil
+      ? sessionsInWindow({
+          timetable: args.timetable,
+          calendarSessions: args.calendarSessions,
+          from: coveredFrom,
+          until: coveredUntil,
+        })
+      : dedupeCalendarSessions(args.calendarSessions).filter((session) => {
+          const startsAt = sessionStartDate(session);
+          return startsAt >= referenceDate && startsAt < projectionEnd;
+        })
     : [];
   const impactedKeys = new Set(impactedSlots.map(sessionKey));
   const assumedAttendedSlots = scheduledThroughProjection.filter(
@@ -1129,6 +1195,12 @@ export function simulateAttendance(args: {
     return acc;
   }, {});
   const totalAssumedAttended = assumedAttendedSlots.length;
+  const scheduleSessions = [...impactedSlots, ...assumedAttendedSlots];
+  const scheduleSourceDates = [...new Set(
+    scheduleSessions
+      .map((session) => session.inferredFromDate)
+      .filter((date): date is string => Boolean(date)),
+  )].sort((a, b) => b.localeCompare(a));
 
   const overallAfterAttended = totalAttended + totalAssumedAttended;
   const overallAfterHeld = totalHeld + totalAssumedAttended + totalMissedClasses;
@@ -1284,6 +1356,8 @@ export function simulateAttendance(args: {
           : 100;
         return afterPercent < threshold && beforePercent >= threshold;
       }).length,
+      scheduleEstimated: scheduleSessions.some((session) => session.estimated),
+      scheduleSourceDates,
     },
   };
 }

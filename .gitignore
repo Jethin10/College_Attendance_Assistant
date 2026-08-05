@@ -25,5 +25,6 @@ Thumbs.db
 .idea/
 
 # Scratch
+tmp/
 tmp-*
 *.tmp

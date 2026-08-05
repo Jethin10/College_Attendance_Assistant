@@ -499,6 +499,99 @@ test("the validated immediate-leave formula stays exact to the decimal", () => {
   assert.equal(result.overall.deltaPercent, 3.37);
 });
 
+test("an unpublished future date falls back to the recent recurring timetable", () => {
+  const result = simulateAttendance({
+    policy: POLICY,
+    subjects: [subject({ id: "maths", attendedClasses: 141, heldClasses: 159 })],
+    timetable: [
+      {
+        id: "thursday-maths",
+        subjectId: "maths",
+        dayOfWeek: 4,
+        startTime: "09:00",
+        endTime: "10:00",
+      },
+    ],
+    // The portal returned a row for Wednesday but nothing for Thursday even
+    // though the declared fetch range includes it.
+    calendarSessions: [session("wednesday", "maths", "2026-08-05", "09:00")],
+    scheduleRangeStart: "2026-07-22",
+    scheduleRangeEnd: "2026-09-19",
+    request: { mode: "leave-days", leaveDays: 1, fromDate: "2026-08-06" },
+    referenceDate: new Date("2026-08-05T20:00:00"),
+  });
+
+  assert.equal(result.overall.classesMissed, 1);
+  assert.equal(result.overall.afterPercent, 88.13);
+  assert.equal(result.impactedSlots[0]?.date, "2026-08-06");
+});
+
+test("an unpublished date reuses one coherent weekday and never unions weeks", () => {
+  const times = ["09:10", "10:00", "10:50", "11:40", "13:30", "14:30", "15:20", "16:10"];
+  const olderThursday = times.map((time, index) =>
+    session(`older-${index}`, index < 4 ? "me-design" : "me-lab", "2026-07-23", time),
+  );
+  const recentThursday = times.map((time, index) =>
+    session(`recent-${index}`, "mba-finance-b", "2026-07-30", time),
+  );
+  // Reproduces the old broken weekly store: two different eight-period weeks
+  // became fifteen unique subject/time rows after one coincident period.
+  const unionedTimetable: ScheduleSlot[] = [
+    ...olderThursday,
+    ...recentThursday.slice(0, 7),
+  ].map((item) => ({
+    id: `slot:${item.id}`,
+    subjectId: item.subjectId,
+    dayOfWeek: item.dayOfWeek,
+    startTime: item.startTime,
+    endTime: item.endTime,
+  }));
+
+  const result = simulateAttendance({
+    policy: POLICY,
+    subjects: [
+      subject({ id: "me-design", code: "ME701", attendedClasses: 40, heldClasses: 45 }),
+      subject({ id: "me-lab", code: "MEL703", attendedClasses: 30, heldClasses: 34 }),
+      subject({ id: "mba-finance-b", code: "MBAF201", attendedClasses: 71, heldClasses: 80 }),
+    ],
+    timetable: unionedTimetable,
+    calendarSessions: [...olderThursday, ...recentThursday],
+    scheduleRangeStart: "2026-07-22",
+    scheduleRangeEnd: "2026-09-19",
+    request: { mode: "leave-days", leaveDays: 1, fromDate: "2026-08-06" },
+    referenceDate: new Date("2026-08-05T20:00:00"),
+  });
+
+  assert.equal(result.overall.beforeAttended, 141);
+  assert.equal(result.overall.beforeHeld, 159);
+  assert.equal(result.overall.classesMissed, 8);
+  assert.equal(result.overall.afterPercent, 84.43);
+  assert.equal(result.summary.scheduleEstimated, true);
+  assert.deepEqual(result.summary.scheduleSourceDates, ["2026-07-30"]);
+  assert.ok(result.impactedSlots.every((item) => item.subjectId === "mba-finance-b"));
+});
+
+test("exact dated rows win over every inferred weekday template", () => {
+  const result = simulateAttendance({
+    policy: POLICY,
+    subjects: [subject({ id: "section-z", attendedClasses: 90, heldClasses: 100 })],
+    timetable: [],
+    calendarSessions: [
+      session("older-a", "section-z", "2028-07-27", "09:00"),
+      session("older-b", "section-z", "2028-07-27", "10:00"),
+      session("exact", "section-z", "2028-08-03", "13:00"),
+    ],
+    scheduleRangeStart: "2028-07-20",
+    scheduleRangeEnd: "2028-09-10",
+    request: { mode: "leave-days", leaveDays: 1, fromDate: "2028-08-03" },
+    referenceDate: new Date("2028-08-02T20:00:00"),
+  });
+
+  assert.equal(result.overall.classesMissed, 1);
+  assert.equal(result.summary.scheduleEstimated, false);
+  assert.deepEqual(result.summary.scheduleSourceDates, []);
+});
+
 test("leave duration uses consecutive calendar days instead of skipping to classes", () => {
   const result = simulateAttendance({
     policy: POLICY,

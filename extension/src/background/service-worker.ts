@@ -95,6 +95,7 @@ async function fallbackScrapeWithScripting(tabId: number) {
     world: "ISOLATED",
     func: async () => {
       const TIMETABLE_RANGE_DAYS = 45;
+      const TIMETABLE_HISTORY_DAYS = 14;
 
       const normalizeWhitespace = (value: string) => value.replace(/\s+/g, " ").trim();
 
@@ -304,9 +305,18 @@ async function fallbackScrapeWithScripting(tabId: number) {
       const normalizeTime = (raw?: string) => {
         const value = raw?.trim();
         if (!value) return null;
-        const match = value.match(/^(\d{1,2}):(\d{2})/);
+        const match = value.match(/^(\d{1,2}):(\d{2})(?:\s*([ap]m))?/i);
         if (!match) return null;
-        return `${match[1].padStart(2, "0")}:${match[2]}`;
+        let hours = Number(match[1]);
+        const minutes = Number(match[2]);
+        const meridiem = match[3]?.toLowerCase();
+        if (meridiem) {
+          if (hours < 1 || hours > 12) return null;
+          hours %= 12;
+          if (meridiem === "pm") hours += 12;
+        }
+        if (hours > 23 || minutes > 59) return null;
+        return `${`${hours}`.padStart(2, "0")}:${`${minutes}`.padStart(2, "0")}`;
       };
 
       const deriveSubjectCode = (row: Record<string, string | undefined>) => {
@@ -318,20 +328,38 @@ async function fallbackScrapeWithScripting(tabId: number) {
         return match?.[0] ?? "unknown";
       };
 
-      const start = new Date();
-      start.setHours(0, 0, 0, 0);
-      const end = new Date(start);
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const start = new Date(today);
+      start.setDate(start.getDate() - TIMETABLE_HISTORY_DAYS);
+      const end = new Date(today);
       end.setDate(end.getDate() + TIMETABLE_RANGE_DAYS);
 
       const [todayPayload, rangePayload, academicPayload] = await Promise.all([
-        fetchJson(`/stu_getTodaysScheduleForStudentLoggedIn.json?date=${encodeURIComponent(formatPortalDate(start))}`),
+        fetchJson(`/stu_getTodaysScheduleForStudentLoggedIn.json?date=${encodeURIComponent(formatPortalDate(today))}`),
         fetchJson(`/getBetweenDatesTimetableForStudent.json?startDate=${encodeURIComponent(formatPortalDate(start))}&endDate=${encodeURIComponent(formatPortalDate(end))}`),
         fetchJson("/stu_getAcademicInformationNew.json"),
       ]);
 
-      const rows = Array.isArray(rangePayload)
+      const rangeRows = Array.isArray(rangePayload)
         ? (rangePayload as Array<Record<string, string | undefined>>)
         : [];
+      const todayRows: Array<Record<string, string | undefined>> = Array.isArray(todayPayload)
+        ? (todayPayload as Array<Record<string, unknown>>).flatMap((item) => {
+            const candidates = Array.isArray(item.timetable) ? item.timetable : [item];
+            return candidates.flatMap((candidate) => {
+              if (!candidate || typeof candidate !== "object") return [];
+              const row = candidate as Record<string, string | undefined>;
+              return [{
+                ...row,
+                lectureDate: row.lectureDate ?? formatPortalDate(today),
+              }];
+            });
+          })
+        : [];
+      // The dedicated today endpoint is sometimes populated before the range
+      // endpoint. Preserve both; storage de-duplicates coincident periods.
+      const rows = [...rangeRows, ...todayRows];
 
       const calendarSessions = rows
         .flatMap((row, index) => {
@@ -398,9 +426,16 @@ async function fallbackScrapeWithScripting(tabId: number) {
       const student = {
         studentName: studentName || undefined,
         semesterLabel: clean(info?.semesterName) ?? semesterSelect?.selectedOptions[0]?.text.trim() ?? undefined,
-        branch: clean(info?.courseName),
-        section: clean(info?.divisionName),
-        rollNo: clean(info?.rollNo),
+        academicYear: clean(
+          info?.academicYearName ??
+          info?.academicYear ??
+          info?.academicSessionName ??
+          info?.sessionName ??
+          info?.batchName,
+        ),
+        branch: clean(info?.courseName ?? info?.branchName ?? info?.programmeName ?? info?.programName),
+        section: clean(info?.divisionName ?? info?.sectionName ?? info?.division ?? info?.section),
+        rollNo: clean(info?.rollNo ?? info?.studentRollNo ?? info?.enrollmentNo ?? info?.registrationNo),
       };
 
       const holidayMessage =

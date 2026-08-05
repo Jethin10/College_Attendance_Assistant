@@ -37,8 +37,8 @@ formulae, and limits of what the extension can predict.
 - **Reads your attendance automatically** when you open the ERP — no typing
 - **Detects your branch, section and semester** from the portal itself, so it
   works for every branch and stream with no configuration
-- **Syncs your real timetable** for the next 45 days, with actual dates, so
-  leave planning accounts for the days you actually have class
+- **Syncs your real timetable** using recent history plus the next 45 days, so
+  unpublished future dates can use the latest recurring class pattern
 - **Plans leave** — pick days off, a date range, or a number of classes, and see
   the effect before you commit
 - **Shows a summary on the ERP page** above your attendance table (dismissible)

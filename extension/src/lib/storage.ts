@@ -6,6 +6,10 @@
  */
 
 import { buildDashboardData, simulateAttendance } from "@/lib/attendance-engine";
+import {
+  buildCoherentWeeklyTimetable,
+  dedupeCalendarSessions,
+} from "@/lib/portal-timetable";
 import type {
   AttendancePolicy,
   AttendanceStore,
@@ -43,6 +47,7 @@ function defaultStudent(): StudentProfile {
     branch: "",
     section: "",
     semesterLabel: "",
+    academicYear: "",
     rollNo: "",
     studentEmail: "",
   };
@@ -278,13 +283,26 @@ export async function savePortalTimetable(args: {
 }): Promise<DashboardData> {
   const store = await readStore();
 
+  if (args.calendarSessions.length === 0) {
+    // An empty NIET response frequently means future sessions have not been
+    // published yet. Never erase the last usable timetable on that signal.
+    store.timetableSync = {
+      ...store.timetableSync,
+      source: store.timetable.length > 0 ? store.timetableSync.source : "portal",
+      status: "error",
+      message: args.message ?? "No timetable rows were returned by the portal.",
+    };
+    await writeStore(store);
+    return getDashboardData();
+  }
+
   const reconciledSessions = reconcileSessionsToSubjects(
-    args.calendarSessions,
+    dedupeCalendarSessions(args.calendarSessions),
     store.subjects,
   );
 
   store.timetable = reconcileTimetableToSubjects(
-    args.timetable,
+    buildCoherentWeeklyTimetable(reconciledSessions),
     reconciledSessions,
     store.subjects,
   );
@@ -412,6 +430,9 @@ export async function saveErpSnapshot(
     store.student.semesterLabel = snapshot.student.semesterLabel;
     store.activeSemesterLabel = snapshot.student.semesterLabel;
   }
+  if (snapshot.student?.academicYear) {
+    store.student.academicYear = snapshot.student.academicYear;
+  }
   if (snapshot.student?.branch) {
     store.student.branch = snapshot.student.branch;
   }
@@ -424,14 +445,19 @@ export async function saveErpSnapshot(
 
   // Subject ids are namespaced by semester because course codes repeat across
   // terms and would otherwise collide with stale calendar sessions.
-  const semesterKey = normalizeCode(store.activeSemesterLabel || "current");
-  const subjectIdFor = (code: string) => `${semesterKey}:${normalizeCode(code)}`;
+  const academicYearKey = normalizeCode(store.student.academicYear || "current-year");
+  const semesterKey = normalizeCode(store.activeSemesterLabel || "current-term");
+  const subjectIdFor = (code: string) =>
+    `${academicYearKey}:${semesterKey}:${normalizeCode(code)}`;
 
   const existingById = new Map(store.subjects.map((subject) => [subject.id, subject]));
+  const existingByCode = new Map(
+    store.subjects.map((subject) => [normalizeCode(subject.code), subject]),
+  );
 
   store.subjects = snapshot.parsedSubjects.map((parsed) => {
     const id = subjectIdFor(parsed.code);
-    const existing = existingById.get(id);
+    const existing = existingById.get(id) ?? existingByCode.get(normalizeCode(parsed.code));
 
     return {
       id,
@@ -471,6 +497,7 @@ export async function saveStudentProfile(
     "branch",
     "section",
     "semesterLabel",
+    "academicYear",
     "rollNo",
     "studentEmail",
   ];

@@ -40,6 +40,10 @@ export interface CalendarSession {
   room?: string;
   faculty?: string;
   source: "portal" | "manual";
+  /** True when this occurrence was inferred because NIET had no dated row. */
+  estimated?: boolean;
+  /** Dated portal schedule used as the template for an inferred occurrence. */
+  inferredFromDate?: string;
 }
 
 export type TimetableSyncStatus = "idle" | "ready" | "error" | "session-expired";
@@ -87,6 +91,7 @@ export interface ERPImportSnapshot {
   student?: {
     studentName?: string;
     semesterLabel?: string;
+    academicYear?: string;
     branch?: string;
     section?: string;
     rollNo?: string;
@@ -99,6 +104,7 @@ export interface StudentProfile {
   branch: string;
   section: string;
   semesterLabel: string;
+  academicYear?: string;
   rollNo: string;
   studentEmail: string;
 }
@@ -167,6 +173,10 @@ export interface SimulationResult {
     subjectsBelowThreshold: number;
     /** Subjects that cross from compliant to below-threshold in this simulation. */
     newThresholdBreaches: number;
+    /** The selected date was inferred from a coherent weekday template. */
+    scheduleEstimated: boolean;
+    /** Portal dates used as templates, newest first. */
+    scheduleSourceDates: string[];
   };
 }
 
