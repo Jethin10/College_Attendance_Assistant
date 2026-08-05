@@ -10,7 +10,7 @@ Everything stays on your device. No server, no account, no analytics.
 ## Which rule it applies
 
 The planner uses NIET's current published
-[Attendance Policy 2025-26](attendance_policy_2025_26.pdf) §1 as a planning
+[Attendance Policy 2025-26](https://www.niet.co.in/uploads/images/695cc928d0c4c1767688488.pdf) §1 as a planning
 reference. It sets 75% in *each* theory and practical subject individually:
 
 > Every student must maintain a minimum of 75% attendance in each theory and
@@ -83,7 +83,7 @@ npm run dev        # watch mode
 npm run build      # typecheck, bundle, generate icons, copy assets
 npm test           # engine and parser tests
 npm run typecheck  # tsc --noEmit
-npm run icons      # regenerate PNG icons from the SVG source
+  npm run icons      # regenerate PNG icons from the programmatic icon source
 npm run package    # verify dist/ and produce a Web Store zip
 ```
 
