@@ -24,8 +24,9 @@ Official sources:
 - AKTU B.Tech ordinance 2018-19: https://aktu.ac.in/pdf/syllabus/Syllabus1819/all/B.%20Tech.%20Ordinance_2018-19.pdf
 - NIET Student Handbook: https://www.niet.co.in/assets/frontend/pdf/NIET-Students-Handbook.pdf
 
-The bundled `attendance_policy_2025_26.pdf` has the same SHA-256 hash as the
-PDF currently linked by NIET's policy page.
+The policy is linked from NIET's official site instead of being duplicated in
+this repository. The copy checked on 5 August 2026 matched the PDF linked by
+NIET's policy page.
 
 ## Why older documents differ
 

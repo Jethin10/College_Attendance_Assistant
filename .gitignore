@@ -5,6 +5,7 @@ node_modules/
 dist/
 .next/
 out/
+*.zip
 
 # Secrets — never commit
 *cookies*.txt
