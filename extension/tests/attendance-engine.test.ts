@@ -353,15 +353,15 @@ test("leave planning supports a custom duration beyond the old preset list", () 
   const result = simulateAttendance({
     policy: POLICY,
     subjects: [subject({ id: "maths", attendedClasses: 50, heldClasses: 50 })],
-    timetable: [
-      {
-        id: "maths-monday",
+    timetable: Array.from({ length: 7 }, (_, dayOfWeek) =>
+      ({
+        id: `maths-${dayOfWeek}`,
         subjectId: "maths",
-        dayOfWeek: 1,
+        dayOfWeek,
         startTime: "09:00",
         endTime: "10:00",
-      },
-    ],
+      }),
+    ),
     calendarSessions: [],
     request: {
       mode: "leave-days",
@@ -369,6 +369,7 @@ test("leave planning supports a custom duration beyond the old preset list", () 
       dayPart: "full",
       fromDate: "2099-01-01",
     },
+    referenceDate: new Date("2098-12-31T23:00:00"),
   });
 
   assert.equal(result.overall.classesMissed, 12);
@@ -420,17 +421,146 @@ test("missed classes are attributed to the subject that owns them", () => {
   }
 });
 
-test("a window with no classes leaves attendance untouched", () => {
+test("a class-free leave date misses nothing while preserving earlier attendance", () => {
   const result = simulateAttendance({
     policy: POLICY,
     subjects: [subject({ id: "maths", attendedClasses: 80, heldClasses: 100 })],
     timetable: [],
     calendarSessions: [session("s1", "maths", "2099-05-10", "09:00")],
     request: { mode: "date-range", fromDate: "2099-06-01", toDate: "2099-06-02" },
+    referenceDate: new Date("2099-05-09T00:00:00"),
   });
 
   assert.equal(result.overall.classesMissed, 0);
-  assert.equal(result.overall.afterPercent, result.overall.beforePercent);
+  assert.equal(result.overall.classesAssumedAttended, 1);
+  assert.ok(result.overall.afterPercent > result.overall.beforePercent);
+});
+
+test("a later leave date includes earlier attended classes", () => {
+  const subjects = [
+    subject({ id: "maths", attendedClasses: 70, heldClasses: 80 }),
+    subject({ id: "dsa", attendedClasses: 63, heldClasses: 71 }),
+  ];
+  const calendarSessions = [
+    session("sixth-1", "maths", "2026-08-06", "09:00"),
+    session("sixth-2", "dsa", "2026-08-06", "10:00"),
+    session("seventh-1", "maths", "2026-08-07", "09:00"),
+  ];
+  const common = {
+    policy: POLICY,
+    subjects,
+    timetable: [] as ScheduleSlot[],
+    calendarSessions,
+    scheduleRangeStart: "2026-08-05",
+    scheduleRangeEnd: "2026-08-31",
+    referenceDate: new Date("2026-08-05T20:00:00"),
+  };
+
+  const sixth = simulateAttendance({
+    ...common,
+    request: { mode: "leave-days", leaveDays: 1, fromDate: "2026-08-06" },
+  });
+  const seventh = simulateAttendance({
+    ...common,
+    request: { mode: "leave-days", leaveDays: 1, fromDate: "2026-08-07" },
+  });
+
+  assert.equal(sixth.overall.classesAssumedAttended, 0);
+  assert.equal(sixth.overall.classesMissed, 2);
+  assert.equal(seventh.overall.classesAssumedAttended, 2);
+  assert.equal(seventh.overall.classesMissed, 1);
+  assert.equal(seventh.overall.afterAttended, 135);
+  assert.equal(seventh.overall.afterHeld, 154);
+  assert.notEqual(sixth.overall.afterPercent, seventh.overall.afterPercent);
+});
+
+test("the validated immediate-leave formula stays exact to the decimal", () => {
+  const calendarSessions = Array.from({ length: 6 }, (_, index) =>
+    session(`sixth-${index}`, index % 2 === 0 ? "maths" : "dsa", "2026-08-06", `${9 + index}:00`),
+  );
+  const result = simulateAttendance({
+    policy: POLICY,
+    subjects: [
+      subject({ id: "maths", attendedClasses: 70, heldClasses: 80 }),
+      subject({ id: "dsa", attendedClasses: 63, heldClasses: 71 }),
+    ],
+    timetable: [],
+    calendarSessions,
+    scheduleRangeStart: "2026-08-05",
+    scheduleRangeEnd: "2026-08-31",
+    request: { mode: "leave-days", leaveDays: 1, fromDate: "2026-08-06" },
+    referenceDate: new Date("2026-08-05T20:00:00"),
+  });
+
+  assert.equal(result.overall.beforePercent, 88.08);
+  assert.equal(result.overall.classesAssumedAttended, 0);
+  assert.equal(result.overall.classesMissed, 6);
+  assert.equal(result.overall.afterPercent, 84.71);
+  assert.equal(result.overall.deltaPercent, 3.37);
+});
+
+test("leave duration uses consecutive calendar days instead of skipping to classes", () => {
+  const result = simulateAttendance({
+    policy: POLICY,
+    subjects: [subject({ id: "maths", attendedClasses: 80, heldClasses: 100 })],
+    timetable: [],
+    calendarSessions: [
+      session("sixth", "maths", "2026-08-06", "09:00"),
+      session("eighth", "maths", "2026-08-08", "09:00"),
+    ],
+    scheduleRangeStart: "2026-08-05",
+    scheduleRangeEnd: "2026-08-31",
+    request: { mode: "leave-days", leaveDays: 2, fromDate: "2026-08-06" },
+    referenceDate: new Date("2026-08-05T20:00:00"),
+  });
+
+  assert.equal(result.overall.classesMissed, 1);
+  assert.deepEqual(result.impactedSlots.map((item) => item.date), ["2026-08-06"]);
+});
+
+test("leave today only counts classes that have not started", () => {
+  const result = simulateAttendance({
+    policy: POLICY,
+    subjects: [subject({ id: "maths", attendedClasses: 80, heldClasses: 100 })],
+    timetable: [],
+    calendarSessions: [
+      session("morning", "maths", "2026-08-06", "09:00"),
+      session("afternoon", "maths", "2026-08-06", "13:00"),
+    ],
+    scheduleRangeStart: "2026-08-06",
+    scheduleRangeEnd: "2026-08-31",
+    request: { mode: "leave-days", leaveDays: 1, fromDate: "2026-08-06" },
+    referenceDate: new Date("2026-08-06T12:00:00"),
+  });
+
+  assert.equal(result.overall.classesMissed, 1);
+  assert.deepEqual(result.impactedSlots.map((item) => item.id), ["afternoon"]);
+});
+
+test("a future half day assumes the other half is attended", () => {
+  const result = simulateAttendance({
+    policy: POLICY,
+    subjects: [subject({ id: "maths", attendedClasses: 80, heldClasses: 100 })],
+    timetable: [],
+    calendarSessions: [
+      session("morning", "maths", "2026-08-06", "09:00"),
+      session("afternoon", "maths", "2026-08-06", "13:00"),
+    ],
+    scheduleRangeStart: "2026-08-05",
+    scheduleRangeEnd: "2026-08-31",
+    request: {
+      mode: "leave-days",
+      leaveDays: 1,
+      dayPart: "morning",
+      fromDate: "2026-08-06",
+    },
+    referenceDate: new Date("2026-08-05T20:00:00"),
+  });
+
+  assert.equal(result.overall.classesMissed, 1);
+  assert.equal(result.overall.classesAssumedAttended, 1);
+  assert.equal(result.overall.afterAttended, 81);
+  assert.equal(result.overall.afterHeld, 102);
 });
 
 test("date ranges are parsed in local time", () => {

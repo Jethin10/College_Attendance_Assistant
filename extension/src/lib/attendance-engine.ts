@@ -817,79 +817,113 @@ function upcomingCalendarSessions(
     .slice(0, count);
 }
 
-function weeklyOccurrencesBetweenDates(
-  timetable: ScheduleSlot[],
-  startDate: Date,
-  endDate: Date,
-  subjectId?: string,
-) {
-  return dateRange(startDate, endDate).flatMap((day) =>
-    timetable
-      .filter(
-        (slot) =>
-          slot.dayOfWeek === day.getDay() &&
-          (!subjectId || slot.subjectId === subjectId),
-      )
-      .map((slot) => makeSessionFromSlot(slot, day)),
-  );
-}
-
-function upcomingDatesWithClassesFromSlots(
-  timetable: ScheduleSlot[],
-  leaveDays: number,
-  startDate?: Date,
-) {
+function requestedLeaveDates(startDate: Date, leaveDays: number) {
   if (leaveDays <= 0) {
     return [];
   }
 
-  if (timetable.length === 0) {
-    return [];
+  const endDate = startOfDay(startDate);
+  endDate.setDate(endDate.getDate() + leaveDays - 1);
+  return dateRange(startDate, endDate);
+}
+
+function scheduleCoverage(args: {
+  calendarSessions: CalendarSession[];
+  rangeStart?: string;
+  rangeEnd?: string;
+  referenceDate: Date;
+}) {
+  if (args.rangeStart && args.rangeEnd) {
+    return { start: args.rangeStart, end: args.rangeEnd };
   }
 
-  const dates: Date[] = [];
-  const cursor = startOfDay(startDate ?? new Date());
-  // A visible duration input has no arbitrary cap. Scan far enough to find the
-  // requested number even for a timetable with only one teaching day a week.
-  const scanLimit = Math.max(PROJECTION_DAY_LIMIT, leaveDays * 14 + 14);
+  const lastSession = latestCalendarSession(args.calendarSessions);
+  if (!lastSession) {
+    return null;
+  }
 
-  for (let i = 0; i < scanLimit && dates.length < leaveDays; i += 1) {
-    if (timetable.some((slot) => slot.dayOfWeek === cursor.getDay())) {
-      dates.push(new Date(cursor));
+  return {
+    start: toDateKey(startOfDay(args.referenceDate)),
+    end: lastSession.date,
+  };
+}
+
+function sessionsForDates(args: {
+  timetable: ScheduleSlot[];
+  calendarSessions: CalendarSession[];
+  dates: Date[];
+  coverage: { start: string; end: string } | null;
+}) {
+  return args.dates.flatMap((day) => {
+    const dateKey = toDateKey(day);
+    const hasExactDate =
+      args.coverage && dateKey >= args.coverage.start && dateKey <= args.coverage.end;
+
+    if (hasExactDate) {
+      return args.calendarSessions.filter((session) => session.date === dateKey);
     }
-    cursor.setDate(cursor.getDate() + 1);
-  }
 
-  return dates;
+    return args.timetable
+      .filter((slot) => slot.dayOfWeek === day.getDay())
+      .map((slot) => makeSessionFromSlot(slot, day));
+  });
 }
 
-function upcomingDatesWithClassesFromSessions(
-  calendarSessions: CalendarSession[],
-  leaveDays: number,
-  startDate?: Date,
-) {
-  if (leaveDays <= 0) {
+function sessionsInWindow(args: {
+  timetable: ScheduleSlot[];
+  calendarSessions: CalendarSession[];
+  from: Date;
+  until: Date;
+  coverage: { start: string; end: string } | null;
+}) {
+  if (args.until <= args.from) {
     return [];
   }
 
-  const floor = startOfDay(startDate ?? new Date());
+  const finalMoment = new Date(args.until.getTime() - 1);
+  return sessionsForDates({
+    timetable: args.timetable,
+    calendarSessions: args.calendarSessions,
+    dates: dateRange(startOfDay(args.from), startOfDay(finalMoment)),
+    coverage: args.coverage,
+  }).filter((session) => {
+    const startsAt = sessionStartDate(session);
+    return startsAt >= args.from && startsAt < args.until;
+  });
+}
 
+function leaveProjectionEnd(request: SimulationRequest) {
+  if (request.mode === "leave-days" && request.fromDate) {
+    const end = startOfDay(parseDateKey(request.fromDate));
+    end.setDate(end.getDate() + Math.max(0, request.leaveDays ?? 0));
+    return end;
+  }
+
+  if (request.mode === "date-range" && request.toDate) {
+    const end = startOfDay(parseDateKey(request.toDate));
+    end.setDate(end.getDate() + 1);
+    return end;
+  }
+
+  return null;
+}
+
+function sessionKey(session: CalendarSession) {
   return [
-    ...new Set(
-      calendarSessions
-        .filter((session) => parseDateKey(session.date) >= floor)
-        .map((session) => session.date),
-    ),
-  ]
-    .sort((a, b) => a.localeCompare(b))
-    .slice(0, leaveDays)
-    .map((dateKey) => parseDateKey(dateKey));
+    session.date,
+    session.subjectId,
+    session.startTime,
+    session.endTime,
+    session.room ?? "",
+  ].join("|");
 }
 
 function impactedSlotsFromRequest(
   timetable: ScheduleSlot[],
   calendarSessions: CalendarSession[],
   request: SimulationRequest,
+  referenceDate = new Date(),
+  coverage: { start: string; end: string } | null = null,
 ) {
   const hasExactSchedule = calendarSessions.length > 0;
 
@@ -959,61 +993,16 @@ function impactedSlotsFromRequest(
     const wantedDays = request.leaveDays ?? 0;
     const matchesSubject = (id: string) => !request.subjectId || id === request.subjectId;
 
-    if (hasExactSchedule) {
-      const days = upcomingDatesWithClassesFromSessions(
-        calendarSessions,
-        wantedDays,
-        startDate,
-      );
-      const dayKeys = new Set(days.map((date) => toDateKey(date)));
-      const exact = calendarSessions.filter(
-        (session) =>
-          dayKeys.has(session.date) &&
-          matchesSubject(session.subjectId) &&
-          matchesLeaveDayPart(session.startTime, request.dayPart),
-      );
-
-      const remainingDays = Math.max(0, wantedDays - days.length);
-      const lastSession = latestCalendarSession(calendarSessions);
-      if (remainingDays === 0 || !lastSession) {
-        return exact;
-      }
-
-      const continuationStart = startOfDay(sessionStartDate(lastSession));
-      continuationStart.setDate(continuationStart.getDate() + 1);
-      if (continuationStart < startDate) {
-        continuationStart.setTime(startDate.getTime());
-      }
-
-      return [
-        ...exact,
-        ...upcomingDatesWithClassesFromSlots(
-          timetable,
-          remainingDays,
-          continuationStart,
-        ).flatMap((day) =>
-          timetable
-            .filter(
-              (slot) =>
-                slot.dayOfWeek === day.getDay() &&
-                matchesSubject(slot.subjectId) &&
-                matchesLeaveDayPart(slot.startTime, request.dayPart),
-            )
-            .map((slot) => makeSessionFromSlot(slot, day)),
-        ),
-      ];
-    }
-
-    return upcomingDatesWithClassesFromSlots(timetable, wantedDays, startDate).flatMap(
-      (day) =>
-        timetable
-          .filter(
-            (slot) =>
-              slot.dayOfWeek === day.getDay() &&
-              matchesSubject(slot.subjectId) &&
-              matchesLeaveDayPart(slot.startTime, request.dayPart),
-          )
-          .map((slot) => makeSessionFromSlot(slot, day)),
+    return sessionsForDates({
+      timetable,
+      calendarSessions,
+      dates: requestedLeaveDates(startDate, wantedDays),
+      coverage,
+    }).filter(
+      (session) =>
+        sessionStartDate(session) >= referenceDate &&
+        matchesSubject(session.subjectId) &&
+        matchesLeaveDayPart(session.startTime, request.dayPart),
     );
   }
 
@@ -1022,59 +1011,36 @@ function impactedSlotsFromRequest(
     return [];
   }
 
-  const fromKey = request.fromDate;
-  const toKey = request.toDate;
-
-  if (hasExactSchedule) {
-    const exact = calendarSessions.filter(
-      (session) =>
-        session.date >= fromKey &&
-        session.date <= toKey &&
-        (!request.subjectId || session.subjectId === request.subjectId),
-    );
-    const lastSession = latestCalendarSession(calendarSessions);
-    if (!lastSession || toKey <= lastSession.date) {
-      return exact;
-    }
-
-    const continuationStart = startOfDay(sessionStartDate(lastSession));
-    continuationStart.setDate(continuationStart.getDate() + 1);
-    const requestedStart = startOfDay(parseDateKey(fromKey));
-    if (continuationStart < requestedStart) {
-      continuationStart.setTime(requestedStart.getTime());
-    }
-
-    return [
-      ...exact,
-      ...weeklyOccurrencesBetweenDates(
-        timetable,
-        continuationStart,
-        parseDateKey(toKey),
-        request.subjectId,
-      ),
-    ];
-  }
-
-  return weeklyOccurrencesBetweenDates(
+  return sessionsForDates({
     timetable,
-    parseDateKey(fromKey),
-    parseDateKey(toKey),
-    request.subjectId,
+    calendarSessions,
+    dates: dateRange(
+      parseDateKey(request.fromDate),
+      parseDateKey(request.toDate),
+    ),
+    coverage,
+  }).filter(
+    (session) =>
+      sessionStartDate(session) >= referenceDate &&
+      (!request.subjectId || session.subjectId === request.subjectId),
   );
 }
 
 function projectionForSubject(args: {
   subject: Subject;
   policy: AttendancePolicy;
+  classesAssumedAttended: number;
   classesMissed: number;
 }): SubjectProjection {
   const beforePercent = computeAttendancePercent(
     args.subject.attendedClasses,
     args.subject.heldClasses,
   );
-  // A missed class increases classes held but not classes attended.
-  const afterHeld = args.subject.heldClasses + args.classesMissed;
-  const afterAttended = args.subject.attendedClasses;
+  // Non-leave sessions before the projection horizon are assumed attended;
+  // leave sessions increase classes held without increasing attendance.
+  const afterHeld =
+    args.subject.heldClasses + args.classesAssumedAttended + args.classesMissed;
+  const afterAttended = args.subject.attendedClasses + args.classesAssumedAttended;
   const afterPercent = computeAttendancePercent(afterAttended, afterHeld);
 
   return {
@@ -1108,12 +1074,40 @@ export function simulateAttendance(args: {
   timetable: ScheduleSlot[];
   calendarSessions: CalendarSession[];
   request: SimulationRequest;
+  /** Portal schedule coverage; dates inside it are exact even when class-free. */
+  scheduleRangeStart?: string;
+  scheduleRangeEnd?: string;
+  /** Test seam for "today" and already-started class handling. */
+  referenceDate?: Date;
 }): SimulationResult {
   const threshold = args.policy.thresholdPercent;
+  const referenceDate = args.referenceDate ?? new Date();
+  const coverage = scheduleCoverage({
+    calendarSessions: args.calendarSessions,
+    rangeStart: args.scheduleRangeStart,
+    rangeEnd: args.scheduleRangeEnd,
+    referenceDate,
+  });
   const impactedSlots = impactedSlotsFromRequest(
     args.timetable,
     args.calendarSessions,
     args.request,
+    referenceDate,
+    coverage,
+  );
+  const projectionEnd = leaveProjectionEnd(args.request);
+  const scheduledThroughProjection = projectionEnd
+    ? sessionsInWindow({
+        timetable: args.timetable,
+        calendarSessions: args.calendarSessions,
+        from: referenceDate,
+        until: projectionEnd,
+        coverage,
+      })
+    : [];
+  const impactedKeys = new Set(impactedSlots.map(sessionKey));
+  const assumedAttendedSlots = scheduledThroughProjection.filter(
+    (session) => !impactedKeys.has(sessionKey(session)),
   );
   const { totalAttended, totalHeld } = totalsOf(args.subjects);
 
@@ -1128,10 +1122,21 @@ export function simulateAttendance(args: {
     (sum, count) => sum + count,
     0,
   );
+  const classesAssumedAttendedBySubject = assumedAttendedSlots.reduce<
+    Record<string, number>
+  >((acc, slot) => {
+    acc[slot.subjectId] = (acc[slot.subjectId] ?? 0) + 1;
+    return acc;
+  }, {});
+  const totalAssumedAttended = assumedAttendedSlots.length;
 
-  const overallAfterHeld = totalHeld + totalMissedClasses;
+  const overallAfterAttended = totalAttended + totalAssumedAttended;
+  const overallAfterHeld = totalHeld + totalAssumedAttended + totalMissedClasses;
   const overallBeforePercent = computeAttendancePercent(totalAttended, totalHeld);
-  const overallAfterPercent = computeAttendancePercent(totalAttended, overallAfterHeld);
+  const overallAfterPercent = computeAttendancePercent(
+    overallAfterAttended,
+    overallAfterHeld,
+  );
 
   const projections = args.subjects
     .filter((subject) => classesMissedBySubject[subject.id])
@@ -1139,6 +1144,7 @@ export function simulateAttendance(args: {
       projectionForSubject({
         subject,
         policy: args.policy,
+        classesAssumedAttended: classesAssumedAttendedBySubject[subject.id] ?? 0,
         classesMissed: classesMissedBySubject[subject.id],
       }),
     );
@@ -1146,12 +1152,13 @@ export function simulateAttendance(args: {
   // Post-absence state for every subject, whether or not it was impacted.
   const afterSubjects = args.subjects.map((subject) => {
     const missed = classesMissedBySubject[subject.id] ?? 0;
+    const assumedAttended = classesAssumedAttendedBySubject[subject.id] ?? 0;
     return {
       id: subject.id,
       name: subject.name,
-      attended: subject.attendedClasses,
-      held: subject.heldClasses + missed,
-      started: subject.heldClasses + missed > 0,
+      attended: subject.attendedClasses + assumedAttended,
+      held: subject.heldClasses + assumedAttended + missed,
+      started: subject.heldClasses + assumedAttended + missed > 0,
     };
   });
 
@@ -1163,12 +1170,12 @@ export function simulateAttendance(args: {
   const perSubject = args.policy.enforcePerSubject;
 
   const overallAfterBunkable = computeBunkableClasses(
-    totalAttended,
+    overallAfterAttended,
     overallAfterHeld,
     threshold,
   );
   const overallAfterRecovery = computeRecoveryClassesNeeded(
-    totalAttended,
+    overallAfterAttended,
     overallAfterHeld,
     threshold,
   );
@@ -1211,13 +1218,13 @@ export function simulateAttendance(args: {
         needBySubject: recoveryBySubject,
         timetable: args.timetable,
         calendarSessions: args.calendarSessions,
-        startDate: new Date(),
+        startDate: projectionEnd ?? referenceDate,
       })
     : computeRecoveryDaysOverall({
         classesNeeded: overallAfterRecovery,
         timetable: args.timetable,
         calendarSessions: args.calendarSessions,
-        startDate: new Date(),
+        startDate: projectionEnd ?? referenceDate,
       });
 
   // Weakest subject after the absence.
@@ -1236,11 +1243,12 @@ export function simulateAttendance(args: {
     overall: {
       beforeAttended: round(totalAttended),
       beforeHeld: round(totalHeld),
-      afterAttended: round(totalAttended),
+      afterAttended: round(overallAfterAttended),
       afterHeld: round(overallAfterHeld),
       beforePercent: overallBeforePercent,
       afterPercent: overallAfterPercent,
       deltaPercent: round(overallBeforePercent - overallAfterPercent),
+      classesAssumedAttended: totalAssumedAttended,
       classesMissed: totalMissedClasses,
       recoveryClassesNeeded: overallRecoveryClassesNeeded,
       recoveryDaysNeeded: recovery.days,
@@ -1249,7 +1257,7 @@ export function simulateAttendance(args: {
         budgets,
         timetable: args.timetable,
         calendarSessions: args.calendarSessions,
-        startDate: new Date(),
+        startDate: projectionEnd ?? referenceDate,
         sharedBudget: perSubject ? undefined : overallAfterBunkable,
       }),
       status: perSubject
@@ -1260,6 +1268,7 @@ export function simulateAttendance(args: {
     },
     summary: {
       impactedSubjects: projections.length,
+      classesAssumedAttended: totalAssumedAttended,
       classesMissed: totalMissedClasses,
       thresholdBreaches: projections.filter(
         (projection) => projection.afterPercent < threshold,

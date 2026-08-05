@@ -333,6 +333,8 @@ export async function saveSimulation(
     subjects: store.subjects,
     timetable: store.timetable,
     calendarSessions: store.calendarSessions,
+    scheduleRangeStart: store.timetableSync.rangeStart,
+    scheduleRangeEnd: store.timetableSync.rangeEnd,
     request,
   });
 
@@ -359,6 +361,8 @@ export async function previewSimulation(
     subjects: store.subjects,
     timetable: store.timetable,
     calendarSessions: store.calendarSessions,
+    scheduleRangeStart: store.timetableSync.rangeStart,
+    scheduleRangeEnd: store.timetableSync.rangeEnd,
     request,
   });
 }

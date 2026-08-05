@@ -142,6 +142,8 @@ export interface SimulationResult {
     beforePercent: number;
     afterPercent: number;
     deltaPercent: number;
+    /** Scheduled classes assumed attended before or around the planned leave. */
+    classesAssumedAttended: number;
     classesMissed: number;
     recoveryClassesNeeded: number;
     recoveryDaysNeeded: number;
@@ -156,6 +158,8 @@ export interface SimulationResult {
   };
   summary: {
     impactedSubjects: number;
+    /** Scheduled non-leave classes included in the chronological projection. */
+    classesAssumedAttended: number;
     classesMissed: number;
     /** Impacted subjects below the threshold after the simulation. */
     thresholdBreaches: number;
