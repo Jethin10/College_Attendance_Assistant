@@ -60,7 +60,22 @@ formulae, and limits of what the extension can predict.
 
 Search for "NIET Attendance Planner", or use the store link once published.
 
-### From source
+### From GitHub Releases (sideload)
+
+1. Go to the [**Releases**](https://github.com/Jethin10/College_Attendance_Assistant/releases) page
+2. Download `niet-attendance-planner-v*.zip` from the latest release
+3. Unzip the downloaded file — you'll get a folder with `manifest.json` inside
+4. Open `chrome://extensions` in Chrome
+5. Enable **Developer mode** (toggle in the top-right corner)
+6. Click **Load unpacked** and select the unzipped folder
+7. Open the NIET ERP, sign in, and visit your attendance page — the extension
+   fills in on its own
+
+> **Updating:** To update, download the new zip, unzip it to the same location
+> (overwrite old files), and click the refresh ↻ button on the extension card
+> at `chrome://extensions`.
+
+### From source (for developers)
 
 ```bash
 cd extension
