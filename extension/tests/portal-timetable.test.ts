@@ -67,6 +67,36 @@ test("deduplicates repeated portal rows for the same student period", () => {
   assert.deepEqual(dedupeCalendarSessions([original, duplicate]), [original]);
 });
 
+test("keeps two different subjects sharing one period", () => {
+  // Parallel lab batches and split sections put distinct subjects in the same
+  // window. A subject-blind key dropped the second one, turning a 9-period
+  // Thursday into 8 and understating the cost of a leave day.
+  const first = portalSession("one", "cs-lab-batch-1", "2026-08-06", "14:00");
+  const second = { ...first, id: "two", subjectId: "cs-lab-batch-2" };
+
+  const deduped = dedupeCalendarSessions([first, second]);
+
+  assert.equal(deduped.length, 2);
+  assert.deepEqual(deduped.map((session) => session.subjectId).sort(), [
+    "cs-lab-batch-1",
+    "cs-lab-batch-2",
+  ]);
+});
+
+test("counts every class on a nine-period day", () => {
+  const periods = Array.from({ length: 8 }, (_, index) =>
+    portalSession(`p-${index}`, `subject-${index}`, "2026-08-06", `${9 + index}:00`),
+  );
+  // Ninth class shares the final window with a different subject.
+  const parallel = {
+    ...periods[7],
+    id: "p-8",
+    subjectId: "subject-8",
+  };
+
+  assert.equal(dedupeCalendarSessions([...periods, parallel]).length, 9);
+});
+
 test("uses one recent weekday schedule instead of merging rotating weeks", () => {
   const older = Array.from({ length: 8 }, (_, index) =>
     portalSession(`older-${index}`, "mechanical-a", "2026-07-23", `${9 + index}:00`),

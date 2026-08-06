@@ -70,9 +70,13 @@ export function extractPortalTimetableRows<T extends { lectureDate?: string }>(
 }
 
 /**
- * A student cannot attend two timetable rows in the same period. JUNO can
- * return duplicates for co-faculty, room changes, or repeated API rows, so a
- * dated schedule is keyed by its time window rather than those volatile fields.
+ * JUNO can return duplicate rows for co-faculty, room changes, or repeated API
+ * calls. Those collapse to one session.
+ *
+ * Subject IS part of the key: NIET legitimately schedules two different
+ * subjects in the same window (parallel lab batches, split sections), and a
+ * subject-blind key silently dropped the extra class — turning a 9-period
+ * Thursday into 8 and under-reporting the cost of a leave day.
  */
 export function dedupeCalendarSessions(
   sessions: CalendarSession[],
@@ -82,7 +86,7 @@ export function dedupeCalendarSessions(
   for (const session of [...sessions].sort(
     (a, b) => a.date.localeCompare(b.date) || a.startTime.localeCompare(b.startTime),
   )) {
-    const key = [session.date, session.startTime, session.endTime].join("|");
+    const key = [session.subjectId, session.date, session.startTime, session.endTime].join("|");
     if (!unique.has(key)) {
       unique.set(key, session);
     }
